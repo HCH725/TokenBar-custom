@@ -338,10 +338,13 @@ enum ClaudeExtraRoots {
             let id = UUID()
             let timeout = Task { @MainActor in
                 try? await Task.sleep(for: .seconds(seconds))
-                guard !Task.isCancelled else { return }
                 resume(id)
             }
-            await withCheckedContinuation { waiters[id] = $0 }
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { waiters[id] = $0 }
+            } onCancel: {
+                Task { @MainActor in resume(id) }
+            }
             timeout.cancel()
         }
 
