@@ -60,6 +60,7 @@ public struct ContributionClient: Codable, Sendable {
         case providerId
         case tokens
         case cost
+        case listPriceEquivalentCost
         case messages
     }
     public let client: String
@@ -67,7 +68,12 @@ public struct ContributionClient: Codable, Sendable {
     public let providerId: String
     public let tokens: TokenBreakdown
     public let cost: Double
+    /// Rate-card equivalent used only for subscription attribution surfaces.
+    /// Optional keeps persisted payloads from older builds decodable.
+    public let listPriceEquivalentCost: Double?
     public let messages: Int
+
+    public var attributionCost: Double { listPriceEquivalentCost ?? cost }
 }
 
 public struct Contribution: Codable, Sendable {

@@ -110,7 +110,8 @@ public struct QuotaHistoryRow: Equatable, Sendable, Identifiable {
     /// The FULL token count, cache reads included, and that is the load-bearing
     /// part. These two feed `WindowEquivalence`, which prints them on one line
     /// as "10% of quota ~ X tokens · $Y API-equivalent" — two descriptions of
-    /// the same work, which a reader divides. `spanCost` is `message.cost`, the
+    /// the same work, which a reader divides. `spanCost` is the attribution
+    /// list-price equivalent when available, falling back to `message.cost`.
     /// message's whole priced cost, and a message's cost cannot be decomposed
     /// here: `WindowMessage` carries one `cost`, not one per token class. So a
     /// count excluding cache reads beside a cost including them is the one
@@ -355,13 +356,13 @@ public enum QuotaHistoryFold {
                     let exCacheRead = message.tokensExCacheRead
                     mine.tokens = mine.tokens.saturatingAdding(message.tokens)
                     mine.exCacheRead = mine.exCacheRead.saturatingAdding(exCacheRead)
-                    mine.cost += message.cost
+                    mine.cost += message.attributionCost
                     let key = ModelKey(
                         providerId: message.providerId, modelId: message.modelId)
                     let current = byModel[key] ?? (0, 0)
                     byModel[key] = (
                         current.tokens.saturatingAdding(message.tokens),
-                        current.cost + message.cost)
+                        current.cost + message.attributionCost)
                 } else {
                     // Three states reach here, and they mean three different
                     // things to the person reading the line: someone else's
@@ -373,7 +374,7 @@ public enum QuotaHistoryFold {
                     case .unassigned: other.hasUnattributed = true
                     }
                     other.tokens = other.tokens.saturatingAdding(message.tokens)
-                    other.cost += message.cost
+                    other.cost += message.attributionCost
                 }
             }
 
@@ -481,7 +482,7 @@ public enum QuotaHistoryFold {
                 // itself.
                 span.tokens = span.tokens.saturatingAdding(
                     WindowEquivalence.ratioTokens(message))
-                span.cost += message.cost
+                span.cost += message.attributionCost
             }
             return span
         }

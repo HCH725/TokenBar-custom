@@ -17,9 +17,9 @@ public enum WindowEquivalence {
     /// old inflated price beside the corrected history directly below it.
     ///
     /// The FULL count, cache reads included, because the cost it is divided
-    /// into is `message.cost` — the message's whole priced cost — and that
-    /// cannot be narrowed to match a smaller count: `WindowMessage` carries one
-    /// cost, not one per token class. Excluding cache reads therefore priced
+    /// into is `message.attributionCost` — the message's whole rate-card
+    /// equivalent — and that cannot be narrowed to match a smaller count.
+    /// Excluding cache reads therefore priced
     /// one set of tokens and counted another, and on a Claude Code workload the
     /// excluded share is most of the volume (issue #237).
     ///
@@ -180,7 +180,7 @@ public enum WindowEquivalence {
             $0.timestamp > first.atMs && $0.timestamp <= last.atMs
         }
         let tokens = inSpan.reduce(Int64(0)) { $0.saturatingAdding(ratioTokens($1)) }
-        let cost = inSpan.reduce(0.0) { $0 + $1.cost }
+        let cost = inSpan.reduce(0.0) { $0 + $1.attributionCost }
         let error = Int((quantisationHalfStep / delta * 100).rounded())
 
         // "Recorded" means either kind of evidence. A provider row can carry a

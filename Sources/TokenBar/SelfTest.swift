@@ -1124,12 +1124,16 @@ enum SelfTest {
         // participate in effective-state resolution.
         func attributionEntry(
             client: String, provider: String, model: String,
-            total: Int64 = 1, cost: Double = 0.0
+            total: Int64 = 1, cost: Double = 0.0,
+            listPriceEquivalentCost: Double? = nil
         ) -> ModelReportEntry {
+            let equivalent = listPriceEquivalentCost.map {
+                ",\"listPriceEquivalentCost\":\($0)"
+            } ?? ""
             let json = """
             {"client":"\(client)","model":"\(model)","provider":"\(provider)",
              "input":1,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,
-             "total":\(total),"messageCount":1,"cost":\(cost),"msPer1kTokens":null}
+             "total":\(total),"messageCount":1,"cost":\(cost)\(equivalent),"msPer1kTokens":null}
             """
             return try! JSONDecoder().decode(
                 ModelReportEntry.self, from: Data(json.utf8))
@@ -1292,6 +1296,24 @@ enum SelfTest {
                 && zeroCostBreakdown.map(\.tokens) == [11, 22, 33]
                 && zeroCostBreakdown.map(\.cost) == [0.0, 0.0, 0.0],
             "zero-cost tokens remain visible in every attribution bucket")
+
+        let codexEquivalentBreakdown = UsageAttributionBreakdown.rows(
+            entries: [
+                attributionEntry(
+                    client: "hermes", provider: "openai", model: "gpt-5.6-terra",
+                    total: 42, cost: 0.0, listPriceEquivalentCost: 0.38),
+            ],
+            clientIds: ["hermes"],
+            confirmed: [
+                UsageAttribution.Record(
+                    client: "hermes", provider: "openai", state: .assigned("codex")),
+            ])
+        expect(
+            codexEquivalentBreakdown.count == 1
+                && codexEquivalentBreakdown[0].state == .assigned("codex")
+                && codexEquivalentBreakdown[0].tokens == 42
+                && abs(codexEquivalentBreakdown[0].cost - 0.38) < 0.000_001,
+            "subscription-included Hermes Codex usage reports API-list-price equivalent instead of actual zero")
 
         let mergedBreakdown = UsageAttributionBreakdown.rows(
             entries: [
@@ -10584,6 +10606,24 @@ enum SelfTest {
                 messages: windowMessages, undatedCount: 0, processingTimeMs: 0
             ).totals(confirmed: [crRecords[0]]).assigned.map(\.target) == ["wide"],
             "CR3 and the provider-wide one still applies when no override exists")
+
+        let codexWindowMessage = try! JSONDecoder().decode(
+            WindowMessage.self,
+            from: Data("""
+            {"timestamp":4000,"client":"hermes","providerId":"openai","modelId":"gpt-5.6-terra",
+             "input":42,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,
+             "cost":0,"listPriceEquivalentCost":0.38,"isTurnStart":true}
+            """.utf8))
+        let codexWindowTotals = WindowUsage(
+            messages: [codexWindowMessage], undatedCount: 0, processingTimeMs: 0
+        ).totals(confirmed: [
+            UsageAttribution.Record(
+                client: "hermes", provider: "openai", state: .assigned("codex")),
+        ])
+        expect(
+            codexWindowTotals.assigned.count == 1
+                && abs(codexWindowTotals.assigned[0].cost - 0.38) < 0.000_001,
+            "quota window attribution uses API-list-price equivalent while source actual cost remains zero")
 
         // CR7. The equivalence footer reads only the settled window. A sample
         // from the previous provider-anchored interval carries the earlier

@@ -17,7 +17,12 @@ public struct WindowMessage: Decodable, Sendable {
     public let cacheWrite: Int64
     public let reasoning: Int64
     public let cost: Double
+    /// API-list-price equivalent for subscription attribution views. Older
+    /// payloads omit it, in which case the historical `cost` value is used.
+    public let listPriceEquivalentCost: Double?
     public let isTurnStart: Bool
+
+    public var attributionCost: Double { listPriceEquivalentCost ?? cost }
 
     /// Saturating, like the graph and report totals that fold the same
     /// untrusted counters. These come from local session files this app does
@@ -85,11 +90,14 @@ public extension WindowUsage {
             switch state {
             case let .assigned(target):
                 let cur = byTarget[target] ?? (0, 0)
-                byTarget[target] = (cur.0.saturatingAdding(m.tokens), cur.1 + m.cost)
+                byTarget[target] = (
+                    cur.0.saturatingAdding(m.tokens), cur.1 + m.attributionCost)
             case .excluded:
-                excluded = (excluded.0.saturatingAdding(m.tokens), excluded.1 + m.cost)
+                excluded = (
+                    excluded.0.saturatingAdding(m.tokens), excluded.1 + m.attributionCost)
             case .unassigned:
-                unassigned = (unassigned.0.saturatingAdding(m.tokens), unassigned.1 + m.cost)
+                unassigned = (
+                    unassigned.0.saturatingAdding(m.tokens), unassigned.1 + m.attributionCost)
             }
         }
 

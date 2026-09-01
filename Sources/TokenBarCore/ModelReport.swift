@@ -16,6 +16,10 @@ public struct ModelReportEntry: Decodable, Sendable {
     public let total: Int64
     public let messageCount: Int
     public let cost: Double
+    /// Separate from `cost`: attribution/quota views can show an API-list-price
+    /// equivalent even when a subscription correctly reports incremental $0.
+    /// Optional keeps older engine payloads decodable during rolling updates.
+    public let listPriceEquivalentCost: Double?
     public let msPer1kTokens: Double?
 }
 
@@ -73,6 +77,9 @@ public extension ModelReport {
                     ? Int.max
                     : messageCount.partialValue,
                 cost: current.cost + entry.cost,
+                listPriceEquivalentCost:
+                    (current.listPriceEquivalentCost ?? current.cost)
+                    + (entry.listPriceEquivalentCost ?? entry.cost),
                 msPer1kTokens: nil
             )
         }
