@@ -85,7 +85,7 @@ docs/knowledge/
 
 | Source | Authority |
 |---|---|
-| Public [`tokscale-core/UPSTREAM.md`](https://github.com/Nanako0129/tokscale-core/blob/fc2941eb914eaa4835712d281d3da8beab25e0d5/UPSTREAM.md) | Exact shared-engine upstream baseline, selected changes, reports, and local-patch ledger |
+| Private canonical [`tokscale-core-custom/UPSTREAM.md`](https://github.com/HCH725/tokscale-core-custom/blob/0a3b42a7f7feac9b4fa23bd2470a7814be967f9c/UPSTREAM.md) | Exact reviewed shared-engine upstream baseline and downstream patch ledger for the current Native consumer pin |
 | `vendor/README.md` | TokenBar's shared-engine repository and reviewed consumer pin |
 | `.github/workflows/*.yml` | Runtime CI, Pages, release, and install-count gates |
 | `Makefile` | Local build order and stale Rust static-library relink guard |
