@@ -7,7 +7,7 @@ the shared-engine boundary and
 [`docs/knowledge/verification.md`](../docs/knowledge/verification.md) for
 required consumer evidence. Engine implementation work follows the private canonical
 downstream's immutable
-[`AGENTS.md`](https://github.com/HCH725/tokscale-core-custom/blob/0a3b42a7f7feac9b4fa23bd2470a7814be967f9c/AGENTS.md); that downstream tracks the public engine upstream.
+[`AGENTS.md`](https://github.com/HCH725/tokscale-core-custom/blob/fcd973a8b4f026d52963910a117f17fc6514e092/AGENTS.md); that downstream tracks the public engine upstream.
 
 ## Invariants
 
