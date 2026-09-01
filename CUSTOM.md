@@ -14,7 +14,7 @@ Do not deploy a local patch that is absent from this repository. Upstream releas
 
 1. CatDesk's append-only `~/.catdesk/usage.jsonl` is ingested by the custom `tokscale-core` dependency as an additional **Hermes** usage source.
 2. CatDesk does not become a separate TokenBar client. Its records are attributed as `client=hermes`, `model=catdesk-mcp`, `provider=catdesk`.
-3. CatDesk input/output tokens count in Hermes totals and TokenBar grand totals. First-version CatDesk cost remains `0`/unknown rather than inventing provider pricing.
+3. CatDesk tokens count in Hermes totals and TokenBar grand totals. The displayed source remains `catdesk-mcp`/`catdesk`, while cost is estimated through tokscale's normal pricing service using the ledger `pricingModel` identity; legacy rows without that field use the explicitly confirmed historical `gpt-5.6-sol` fallback. MCP direction is translated before pricing (`outputTokens` → model input, `inputTokens` → model output).
 4. TokenBar never writes to Hermes `state.db` or CatDesk's ledger.
 5. Private production bundles must not auto-update from the official Nanako0129 Sparkle feed. Autostart remains available.
 6. Once the private build is installed, the official Homebrew cask must no longer own `/Applications/TokenBar.app`.
