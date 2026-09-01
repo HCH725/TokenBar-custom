@@ -167,6 +167,7 @@ struct Message {
     cache_write: i64,
     reasoning: i64,
     cost: f64,
+    list_price_equivalent_cost: f64,
     is_turn_start: bool,
 }
 
@@ -207,6 +208,7 @@ pub(crate) fn run(
                 cache_write: m.cache_write,
                 reasoning: m.reasoning,
                 cost: m.cost,
+                list_price_equivalent_cost: m.list_price_equivalent_cost,
                 is_turn_start: m.is_turn_start,
             })
             .collect(),
