@@ -55,7 +55,19 @@ public enum ClientRegistry {
         "micode": ("MiMo Code", "#fb923c"),
         "gjc": ("gjc", "#e11d48"),
         "grok": ("Grok Build", "#1f2937"),
+        // The DeepSeek API account itself, named "Official" so the card is not
+        // read as another client's use of DeepSeek models.
+        "deepseek": ("DeepSeek Official", "#4d6bfe"),
     ]
+
+    /// Clients whose only presence signal is their quota-payload entry.
+    ///
+    /// A provider-backed account with no local usage logs can never appear in
+    /// the graph's client list, so the Settings row and the individual status
+    /// item derive their presence from the payload instead of the graph. Named
+    /// explicitly rather than "every payload client" so no existing client's
+    /// presence changes.
+    public static let quotaOnlyClientIds: Set<String> = ["deepseek"]
 
     /// Every registered client id, sorted. Demo fixtures use this canonical
     /// universe so every usage surface renders the same client set.

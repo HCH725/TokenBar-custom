@@ -4,6 +4,7 @@ use crate::agent_account_scope::{
 };
 use crate::agent_antigravity;
 use crate::agent_copilot;
+use crate::agent_deepseek;
 use crate::agent_grok;
 use crate::agent_quota_duration::{DurationEvidence, DurationSource, DurationUnavailableReason};
 use crate::agent_quota_history::{
@@ -144,6 +145,12 @@ pub struct AgentUsageSnapshot {
     pub(crate) history_scope: Result<HistoryScope, AccountScopeError>,
     windows: Vec<UsageWindow>,
     credits: Option<CreditsSnapshot>,
+    /// Currency balance for a provider whose account is a prepaid API balance
+    /// rather than a percent quota (DeepSeek Official). Additive and optional:
+    /// an absent key means "this card has no balance", and no percent is ever
+    /// derived from an amount.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    balance: Option<BalanceSnapshot>,
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     transport_diagnostic: Option<SafeTransportDiagnostic>,
@@ -623,6 +630,25 @@ pub struct UsageWindow {
 pub struct CreditsSnapshot {
     remaining: Option<f64>,
     unlimited: bool,
+}
+
+/// A provider-reported account balance in its own currency.
+///
+/// Deliberately not `CreditsSnapshot`: credits are an entitlement with no
+/// currency and no granted/topped-up split, and deliberately not a
+/// `UsageWindow`: a window is a percentage with a reset. `currency` travels
+/// with the amounts because the provider chooses it per account — hard-coding
+/// a symbol would state something the provider never said.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceSnapshot {
+    pub(crate) currency: String,
+    pub(crate) total: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) granted: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) topped_up: Option<f64>,
+    pub(crate) is_available: bool,
 }
 
 #[derive(Serialize)]
@@ -1357,6 +1383,7 @@ fn empty_error_snapshot(
         history_scope: Err(AccountScopeError::NoTrustedEvidence),
         windows: Vec::new(),
         credits: None,
+        balance: None,
         error: Some(display),
         transport_diagnostic,
     }
@@ -1377,6 +1404,10 @@ fn usable_success(snapshot: &AgentUsageSnapshot) -> bool {
             .iter()
             .any(|window| window.card_id == "billing.weekly.v1"),
         "claude" | "copilot" | "antigravity" => !snapshot.windows.is_empty(),
+        "deepseek" => snapshot
+            .balance
+            .as_ref()
+            .is_some_and(|balance| balance.total.is_finite()),
         _ => false,
     }
 }
@@ -1504,12 +1535,13 @@ fn apply_provider_outcome(
 
 pub async fn run(publication_generation: u64) -> AgentUsagePayload {
     let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-    let (codex, claude, antigravity, copilot, grok) = tokio::join!(
+    let (codex, claude, antigravity, copilot, grok, deepseek) = tokio::join!(
         fetch_codex(),
         fetch_claude_accounts(),
         fetch_antigravity(),
         fetch_copilot(),
-        fetch_grok()
+        fetch_grok(),
+        fetch_deepseek()
     );
     let mut agents = vec![codex];
     // The primary first, then any extra config directories. With none
@@ -1524,6 +1556,10 @@ pub async fn run(publication_generation: u64) -> AgentUsagePayload {
     if let Some(grok) = grok {
         agents.push(grok);
     }
+    // DeepSeek Official is always published. Its card is the capability signal
+    // for its Settings row, and a missing credential or a rejected key is
+    // reported as an error-only card instead of a fabricated zero.
+    agents.push(deepseek);
     AgentUsagePayload {
         generated_at,
         publication_generation,
@@ -1548,6 +1584,7 @@ async fn fetch_grok() -> Option<AgentUsageSnapshot> {
                 history_scope: agent_account_scope::resolve_history_scope("grok", None),
                 windows: data.windows,
                 credits: None,
+                balance: None,
                 error: None,
                 transport_diagnostic: None,
             },
@@ -1556,6 +1593,35 @@ async fn fetch_grok() -> Option<AgentUsageSnapshot> {
         Err(failure) => ProviderFetchOutcome::Failure(failure),
     };
     apply_provider_outcome("grok", None, "oauth", now, outcome)
+}
+
+/// DeepSeek Official: a prepaid API balance, not a percent quota. It carries
+/// no windows on purpose — the amount is not a percentage and must not enter
+/// pace, history, or the quota curve.
+async fn fetch_deepseek() -> AgentUsageSnapshot {
+    let now = Utc::now();
+    let outcome = match agent_deepseek::fetch().await {
+        Ok(data) => ProviderFetchOutcome::Success {
+            cache_binding: Some(data.cache_binding),
+            snapshot: AgentUsageSnapshot {
+                account_key: None,
+                client_id: "deepseek".to_string(),
+                source: "api-key".to_string(),
+                updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+                identity: data.identity,
+                account_scope: data.account_scope,
+                history_scope: agent_account_scope::resolve_history_scope("deepseek", None),
+                windows: Vec::new(),
+                credits: None,
+                balance: Some(data.balance),
+                error: None,
+                transport_diagnostic: None,
+            },
+        },
+        Err(failure) => ProviderFetchOutcome::Failure(failure),
+    };
+    apply_provider_outcome("deepseek", None, "api-key", now, outcome)
+        .expect("DeepSeek is a required provider card")
 }
 
 async fn fetch_copilot() -> Option<AgentUsageSnapshot> {
@@ -1582,6 +1648,7 @@ async fn fetch_copilot() -> Option<AgentUsageSnapshot> {
                         history_scope: agent_account_scope::resolve_history_scope("copilot", None),
                         windows: data.windows,
                         credits: None,
+                        balance: None,
                         error: None,
                         transport_diagnostic: None,
                     },
@@ -1608,6 +1675,7 @@ async fn fetch_antigravity() -> AgentUsageSnapshot {
                 history_scope: fetched.history_scope,
                 windows: fetched.windows,
                 credits: None,
+                balance: None,
                 error: None,
                 transport_diagnostic: None,
             },
@@ -2031,6 +2099,7 @@ async fn fetch_codex_inner() -> ProviderFetchOutcome {
                 remaining: credits.balance,
                 unlimited: credits.unlimited,
             }),
+            balance: None,
             error: None,
             transport_diagnostic: None,
         },
@@ -2668,6 +2737,7 @@ async fn fetch_claude_oauth_usage_request(
                 history_scope: identity.history_scope.clone(),
                 windows,
                 credits: claude_credits(usage.extra_usage.as_ref()),
+                balance: None,
                 error: None,
                 transport_diagnostic: None,
             },
@@ -2949,6 +3019,7 @@ async fn claude_header_snapshot(
             history_scope: identity.history_scope.clone(),
             windows,
             credits: None,
+            balance: None,
             error: None,
             transport_diagnostic: None,
         },
@@ -5860,6 +5931,7 @@ mod tests {
                 email: Some("fixture@example.invalid".to_string()),
                 plan: Some("Fixture".to_string()),
             }),
+            balance: None,
             history_scope: account_scope
                 .as_ref()
                 .map(|scope| HistoryScope::for_test(scope.as_str()))
@@ -6381,6 +6453,7 @@ mod tests {
                     account_scope: Ok(account_scope),
                     windows,
                     credits: None,
+                    balance: None,
                     error: None,
                     transport_diagnostic: None,
                 },
@@ -7513,6 +7586,7 @@ mod tests {
             account_scope: Ok(account_scope),
             windows,
             credits: None,
+            balance: None,
             error: None,
             transport_diagnostic: None,
         };
@@ -8621,6 +8695,7 @@ mod tests {
             account_scope: Ok(account_scope),
             windows: vec![window],
             credits: None,
+            balance: None,
             error: None,
             transport_diagnostic: None,
         };
@@ -8742,6 +8817,7 @@ mod tests {
             account_scope: Ok(account_scope),
             windows: vec![weekly, new_window],
             credits: None,
+            balance: None,
             error: None,
             transport_diagnostic: None,
         };
@@ -10813,6 +10889,7 @@ mod tests {
                 make_window("Duplicate card", "shared-card.v1", "third.v1", 30.0),
             ],
             credits: None,
+            balance: None,
             error: None,
             transport_diagnostic: None,
         };
@@ -10873,6 +10950,7 @@ mod tests {
                 make_window("B/Z", "b.v1", "z.v1", 50.0),
             ],
             credits: None,
+            balance: None,
             error: None,
             transport_diagnostic: None,
         };
@@ -10966,6 +11044,7 @@ mod tests {
                 ),
             ],
             credits: None,
+            balance: None,
             error: None,
             transport_diagnostic: None,
         };
@@ -11040,6 +11119,7 @@ mod tests {
                 Some(DurationEvidence::contract(86_400)),
             )],
             credits: None,
+            balance: None,
             error: None,
             transport_diagnostic: None,
         };
@@ -11095,6 +11175,7 @@ mod tests {
                 Some(DurationEvidence::contract(86_400)),
             )],
             credits: None,
+            balance: None,
             error: None,
             transport_diagnostic: None,
         };
@@ -11230,6 +11311,7 @@ mod tests {
                 .with_identity("row.unknown.v1", None, None, None),
             ],
             credits: None,
+            balance: None,
             error: None,
             transport_diagnostic: None,
         };
@@ -11308,6 +11390,7 @@ mod tests {
                 history_scope: Ok(history_scope),
                 windows: vec![histid_window(10.0 + index as f64 * 10.0, reset, sampled_at)],
                 credits: None,
+                balance: None,
                 error: None,
                 transport_diagnostic: None,
             };
@@ -11420,6 +11503,7 @@ mod tests {
             history_scope: Ok(history_scope),
             windows: vec![histid_window(20.0, start + 5 * 3_600, start)],
             credits: None,
+            balance: None,
             error: None,
             transport_diagnostic: None,
         };
@@ -11788,6 +11872,7 @@ mod tests {
             history_scope: identity.history_scope.clone(),
             windows: vec![window],
             credits: None,
+            balance: None,
             error: None,
             transport_diagnostic: None,
         }
@@ -12533,6 +12618,7 @@ mod tests {
                     ),
                 ],
                 credits: None,
+                balance: None,
                 error: None,
                 transport_diagnostic: None,
             }],

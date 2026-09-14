@@ -4239,6 +4239,83 @@ enum SelfTest {
                 && lastGoodRuntime?.toolTip.contains("timed out") == false,
             "explicit error fallback is labeled as last-known quota, not current data")
 
+        // DeepSeek Official is a currency balance, not a quota percentage: the
+        // amount is shown as money, the card exists with no local usage logs,
+        // and a payload that predates the additive field still decodes.
+        let balanceJSON = """
+        {"generatedAt":"now","agents":[
+          {"clientId":"deepseek","source":"api-key","updatedAt":"now","windows":[],
+           "balance":{"currency":"USD","total":3.41,"granted":1.0,"toppedUp":2.41,"isAvailable":true}}
+        ]}
+        """
+        let balancePayload = try! JSONDecoder().decode(
+            AgentUsagePayload.self, from: Data(balanceJSON.utf8))
+        expect(
+            balancePayload.agents.first?.balance?.total == 3.41
+                && balancePayload.agents.first?.balance?.granted == 1.0
+                && balancePayload.agents.first?.balance?.toppedUp == 2.41
+                && balancePayload.agents.first?.balance?.isAvailable == true
+                && quotaPayload.agents.allSatisfy { $0.balance == nil },
+            "a balance decodes only where the payload carries it")
+        let balanceRow = ClientTray.settingsRows(
+            presentClients: [], payload: balancePayload, enabled: [], selections: [:],
+            hidden: [], orderRaw: "",
+            officialClients: officialClientIDs).first
+        expect(
+            balanceRow?.clientId == "deepseek"
+                && balanceRow?.displayName == "DeepSeek Official"
+                && balanceRow?.valueText == "3.41"
+                && balanceRow?.accessibilityLabel.contains("3.41 USD") == true
+                && balanceRow?.accessibilityLabel.contains("1.00 granted") == true
+                && balanceRow?.accessibilityLabel.contains("2.41 topped up") == true,
+            "a payload-only balance client is configurable and reads as money")
+        let balanceRuntime = ClientTray.runtimePresentations(
+            graph: clientGraph, payload: balancePayload, enabled: ["deepseek"],
+            selections: [:], hidden: [], officialClients: officialClientIDs).first
+        expect(
+            balanceRuntime?.clientId == "deepseek"
+                && balanceRuntime?.status == .available
+                && balanceRuntime?.valueText == "3.41"
+                && balanceRuntime?.toolTip.contains("3.41 USD balance") == true
+                && balanceRuntime?.toolTip.contains("2.41 topped up") == true
+                && balanceRuntime?.toolTip.contains("%") == false
+                && balanceRuntime?.accessibilityLabel.contains("%") == false,
+            "the DeepSeek item shows its amount and never a fabricated percentage")
+        // The currency travels with the amount: the same 110 reads as yen, and
+        // an absent granted/topped-up split stays absent instead of zero.
+        let cnyBalance = try! JSONDecoder().decode(
+            AgentUsagePayload.self, from: Data("""
+            {"generatedAt":"now","agents":[
+              {"clientId":"deepseek","source":"api-key","updatedAt":"now","windows":[],
+               "balance":{"currency":"CNY","total":110,"isAvailable":true}}
+            ]}
+            """.utf8)).agents.first!.balance!
+        expect(
+            ClientTray.balanceValueText(cnyBalance) == "¥110.00"
+                && ClientTray.balanceSummary("DeepSeek Official", cnyBalance)
+                    == "DeepSeek Official — 110.00 CNY balance"
+                && ClientTray.balanceValueText(balancePayload.agents.first!.balance!) == "3.41",
+            "balance formatting follows the currency and omits unstated amounts")
+        // A transient failure serves the last-good balance; the card must say so
+        // rather than dropping it.
+        let staleBalancePayload = try! JSONDecoder().decode(
+            AgentUsagePayload.self, from: Data("""
+            {"generatedAt":"now","agents":[
+              {"clientId":"deepseek","source":"api-key","updatedAt":"now","windows":[],
+               "balance":{"currency":"USD","total":3.41,"isAvailable":true},
+               "error":"DeepSeek balance request failed. Retrying automatically."}
+            ]}
+            """.utf8))
+        let staleBalance = ClientTray.runtimePresentations(
+            graph: clientGraph, payload: staleBalancePayload, enabled: ["deepseek"],
+            selections: [:], hidden: [], officialClients: officialClientIDs).first
+        expect(
+            staleBalance?.valueText == "3.41"
+                && staleBalance?.status == .errorAuto
+                && staleBalance?.toolTip.contains("last known") == true
+                && staleBalance?.toolTip.contains("Retrying automatically") == false,
+            "a last-good balance is shown as last known, not as current data")
+
         // Rows must not depend on Set iteration order. With no saved tab order
         // and no payload, every row comes from the preserved-enabled path, which
         // must follow the ordered `present` array.
