@@ -495,6 +495,7 @@ mod tests {
             reasoning,
             message_count: 1,
             cost: 0.0,
+            list_price_equivalent_cost: 0.0,
             performance: tokscale_core::ModelPerformance::default(),
         }
     }

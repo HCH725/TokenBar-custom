@@ -23,12 +23,14 @@ Do not deploy a local patch that is absent from this repository. Upstream releas
 
 ## Update workflow
 
+The operational procedure is [`skills/tokenbar-release-update/SKILL.md`](skills/tokenbar-release-update/SKILL.md); this file remains the contract (what must remain true) and wins on any conflict about it, while authorization gates stay owned by [`docs/knowledge/workflow.md`](docs/knowledge/workflow.md).
+
 1. Fetch the official upstream release and review release notes and architecture changes.
 2. Update `HCH725/tokscale-core-custom` first when the parser boundary changes; keep the custom delta minimal and run its complete test suite.
 3. Merge the reviewed tokscale revision and update TokenBar's submodule pointer to that accepted commit.
 4. Port only the smallest TokenBar-specific custom changes still required, including the official-update guardrail.
-5. Run TokenBar self-tests/smoke tests and verify Hermes totals include CatDesk ledger data without creating a CatDesk client, and that OpenCode Go rows use the provider-scoped official usage-value pricing.
+5. Run TokenBar self-tests/smoke tests and verify Hermes totals include CatDesk ledger data without creating a CatDesk client, that OpenCode Go rows use the provider-scoped official usage-value pricing, and that Codex `openai-codex` rows marked `cost_status=included` keep authoritative incremental cost `$0` with the separate ChatGPT Work/Codex equivalent display and no quota inference from those dollars.
 6. Perform an independent audit before accepting the private release.
-7. Merge/tag the accepted private revision, build the `.app`, then replace local production. Keep the previous working app available for rollback.
+7. Commit, push, PR, merge, tag, release, install, and production replacement each require the applicable explicit user authorization; implementation, local build, and verification do not. Under that authorization, merge/tag the accepted private revision, build the `.app`, and replace local production, keeping the previous working app available for rollback.
 
 Never let Homebrew or the official Sparkle feed silently move production ahead of the private canonical repository.
