@@ -287,6 +287,14 @@ final class StatusItemController: NSObject {
         button.setAccessibilityLabel(presentation.accessibilityLabel)
         button.setAccessibilityIdentifier(presentation.processIdentity)
         button.identifier = NSUserInterfaceItemIdentifier(presentation.processIdentity)
+        // The DeepSeek Official item is a balance readout, not a usage source:
+        // it shows the amount but must not route the popover at a client tab
+        // that has no session to show.
+        guard presentation.clientId != "deepseek" else {
+            button.target = nil
+            button.action = nil
+            return
+        }
         button.target = self
         button.action = #selector(clientItemAction(_:))
         button.sendAction(on: [.leftMouseUp])

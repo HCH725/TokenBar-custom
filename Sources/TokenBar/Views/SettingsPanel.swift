@@ -341,7 +341,7 @@ struct SettingsPanel: View {
                     .accessibilityLabel("Show %@ individual item".localized(row.displayName))
             }
 
-            if row.isEnabled {
+            if row.isEnabled, row.balance == nil {
                 HStack {
                     Text("Window")
                         .font(.caption2)

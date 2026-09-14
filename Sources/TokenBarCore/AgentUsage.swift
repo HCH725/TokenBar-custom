@@ -484,6 +484,19 @@ public struct CreditsSnapshot: Decodable, Sendable {
     public let unlimited: Bool
 }
 
+/// A provider-reported account balance in the provider's own currency.
+///
+/// Deliberately not `CreditsSnapshot` (an entitlement with no currency and no
+/// granted/topped-up split) and deliberately not a `UsageWindow` (a percentage
+/// with a reset): an amount must never be displayed as a quota percentage.
+public struct BalanceSnapshot: Decodable, Sendable, Equatable {
+    public let currency: String
+    public let total: Double
+    public let granted: Double?
+    public let toppedUp: Double?
+    public let isAvailable: Bool
+}
+
 public struct AgentUsageTransportDiagnostic: Decodable, Sendable {
     public let category: String?
     public let status: Int64?
@@ -512,11 +525,14 @@ public struct AgentUsageSnapshot: Decodable, Sendable {
     public let identity: AgentIdentity?
     public let windows: [UsageWindow]
     public let credits: CreditsSnapshot?
+    /// Additive optional currency balance; absent for every window-based
+    /// provider, which is every provider but DeepSeek Official today.
+    public let balance: BalanceSnapshot?
     public let error: String?
     public let transportDiagnostic: AgentUsageTransportDiagnostic?
 
     private enum CodingKeys: String, CodingKey {
-        case clientId, accountKey, source, updatedAt, identity, windows, credits, error,
+        case clientId, accountKey, source, updatedAt, identity, windows, credits, balance, error,
             transportDiagnostic
     }
 
@@ -529,6 +545,7 @@ public struct AgentUsageSnapshot: Decodable, Sendable {
         self.identity = try container.decodeIfPresent(AgentIdentity.self, forKey: .identity)
         self.windows = try container.decode([UsageWindow].self, forKey: .windows)
         self.credits = try container.decodeIfPresent(CreditsSnapshot.self, forKey: .credits)
+        self.balance = try container.decodeIfPresent(BalanceSnapshot.self, forKey: .balance)
         self.error = try container.decodeIfPresent(String.self, forKey: .error)
         self.transportDiagnostic = try? container.decode(
             AgentUsageTransportDiagnostic.self, forKey: .transportDiagnostic)
