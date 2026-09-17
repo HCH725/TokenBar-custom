@@ -133,6 +133,8 @@ enum ClientTray {
         let isEnabled: Bool
         let selection: String
         let remainingPercent: Double?
+        /// Set only for a currency-balance card, which has no percent at all.
+        let balance: BalanceSnapshot?
         let status: Status
         let options: [WindowOption]
 
@@ -140,10 +142,14 @@ enum ClientTray {
 
         var statusHint: String? { status.hint }
 
-        var valueText: String { ClientTray.percentText(remainingPercent) }
+        var valueText: String {
+            if let balance { return ClientTray.balanceValueText(balance) }
+            return ClientTray.percentText(remainingPercent)
+        }
 
         var accessibilityLabel: String {
-            ClientTray.quotaAccessibilityLabel(displayName, remainingPercent)
+            if let balance { return ClientTray.balanceAccessibilityLabel(displayName, balance) }
+            return ClientTray.quotaAccessibilityLabel(displayName, remainingPercent)
         }
     }
 
@@ -153,14 +159,28 @@ enum ClientTray {
         let clientId: String
         let displayName: String
         let remainingPercent: Double?
+        /// Set only for a currency-balance card, which has no percent at all.
+        let balance: BalanceSnapshot?
         let status: Status
 
         var processIdentity: String { ClientTray.processIdentity(for: clientId) }
         var autosaveName: String { ClientTray.autosaveName(for: clientId) }
 
-        var valueText: String { ClientTray.percentText(remainingPercent) }
+        var valueText: String {
+            if let balance { return ClientTray.balanceValueText(balance) }
+            return ClientTray.percentText(remainingPercent)
+        }
+
+        /// A reused window value under an error is last-known; so is a balance,
+        /// which the provider chose to keep serving through a transient failure.
+        private var isStale: Bool {
+            status == .errorAuto || status == .errorExplicit
+        }
 
         var toolTip: String {
+            if let balance {
+                return ClientTray.balanceSummary(displayName, balance, stale: isStale)
+            }
             if status == .missingSelection {
                 return "%@ — selected quota window unavailable".localized(displayName)
             }
@@ -175,6 +195,10 @@ enum ClientTray {
         }
 
         var accessibilityLabel: String {
+            if let balance {
+                return ClientTray.balanceAccessibilityLabel(
+                    displayName, balance, stale: isStale)
+            }
             if status == .missingSelection {
                 return "%@, selected quota window unavailable".localized(displayName)
             }
@@ -291,7 +315,11 @@ enum ClientTray {
         orderRaw: String,
         officialClients: Set<String>
     ) -> [SettingsRow] {
-        let present = canonicalIDs(presentClients)
+        // Quota-only clients are appended: a provider-backed card has no local
+        // usage logs, so the graph can never name it. Explicitly listed rather
+        // than "every payload client" so no existing client's presence moves.
+        let present = canonicalIDs(
+            presentClients + ClientRegistry.quotaOnlyClientIds.sorted())
         // Agent presence in the quota payload is the stable capability signal.
         // A supported provider can temporarily return only an error and zero
         // windows (for example while its local OAuth client is unavailable);
@@ -370,6 +398,7 @@ enum ClientTray {
                 isEnabled: enabled.contains(clientId),
                 selection: selection,
                 remainingPercent: resolved?.remainingPercent,
+                balance: snapshot?.balance,
                 status: status,
                 options: options)
         }
@@ -383,7 +412,11 @@ enum ClientTray {
         hidden: Set<String>,
         officialClients: Set<String>
     ) -> [Presentation] {
-        let present = canonicalIDs(graph?.summary.clients ?? [])
+        // Quota-only clients are appended for the same reason Settings appends
+        // them: the graph has no entry for a provider the user only holds an
+        // API account with.
+        let present = canonicalIDs(
+            (graph?.summary.clients ?? []) + ClientRegistry.quotaOnlyClientIds.sorted())
         return present
             .filter { enabled.contains($0) && officialClients.contains($0) && !hidden.contains($0) }
             .sorted()
@@ -406,13 +439,18 @@ enum ClientTray {
                     status = .missingSelection
                 } else if snapshot?.error != nil {
                     status = selection == autoSelection ? .errorAuto : .errorExplicit
+                } else if resolved == nil, snapshot?.balance == nil {
+                    status = .unavailable
                 } else {
-                    status = resolved == nil ? .unavailable : .available
+                    // A balance is a live value with no window to resolve, so an
+                    // absent window must not read as "quota unavailable".
+                    status = .available
                 }
                 return Presentation(
                     clientId: clientId,
                     displayName: ClientRegistry.style(clientId).displayName,
                     remainingPercent: resolved?.remainingPercent,
+                    balance: snapshot?.balance,
                     status: status)
             }
     }
@@ -426,6 +464,63 @@ enum ClientTray {
 
     static func percentText(_ value: Double?) -> String {
         percentInt(value).map { "\($0)%" } ?? "—%"
+    }
+
+    /// Two decimals, always: a balance is money, and "3.4" and "3.41" are
+    /// different amounts. The currency travels with the value; USD is the
+    /// unprefixed default the item was asked for, every other currency keeps a
+    /// visible marker so a ¥ amount is never read as dollars.
+    static func balanceAmount(_ value: Double) -> String {
+        guard value.isFinite else { return "—" }
+        return String(format: "%.2f", value)
+    }
+
+    static func balanceValueText(_ balance: BalanceSnapshot) -> String {
+        let amount = balanceAmount(balance.total)
+        switch balance.currency {
+        case "USD": return amount
+        case "CNY": return "¥\(amount)"
+        default: return "\(balance.currency) \(amount)"
+        }
+    }
+
+    /// Display name plus every stated amount. The item's value text carries the
+    /// total only, so granted/topped-up/availability live here.
+    static func balanceSummary(
+        _ displayName: String, _ balance: BalanceSnapshot, stale: Bool = false
+    ) -> String {
+        let amount = balanceAmount(balance.total)
+        let text = stale
+            ? "%@ — %@ %@ balance, last known".localized(displayName, amount, balance.currency)
+            : "%@ — %@ %@ balance".localized(displayName, amount, balance.currency)
+        return text + balanceDetailSuffix(balance)
+    }
+
+    static func balanceAccessibilityLabel(
+        _ displayName: String, _ balance: BalanceSnapshot, stale: Bool = false
+    ) -> String {
+        let amount = balanceAmount(balance.total)
+        let label = stale
+            ? "%@, %@ %@ balance remaining, last known".localized(
+                displayName, amount, balance.currency)
+            : "%@, %@ %@ balance remaining".localized(displayName, amount, balance.currency)
+        return label + balanceDetailSuffix(balance)
+    }
+
+    /// The granted/topped-up/availability tail shared by the tooltip and the
+    /// accessibility label, so the two can never disagree about an amount.
+    private static func balanceDetailSuffix(_ balance: BalanceSnapshot) -> String {
+        var text = ""
+        if let granted = balance.granted {
+            text += " · " + "%@ granted".localized(balanceAmount(granted))
+        }
+        if let toppedUp = balance.toppedUp {
+            text += " · " + "%@ topped up".localized(balanceAmount(toppedUp))
+        }
+        if !balance.isAvailable {
+            text += " · " + "not available".localized
+        }
+        return text
     }
 
     static func quotaAccessibilityLabel(_ displayName: String, _ value: Double?) -> String {

@@ -104,6 +104,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <string>14.0</string>
     <key>LSUIElement</key>
     <true/>
+    <!-- Private canonical builds must never follow Nanako0129's Sparkle feed;
+         upstream releases are merged into this repo before local deployment. -->
+    <key>TokenBarOfficialUpdatesEnabled</key>
+    <false/>
     <key>NSHumanReadableCopyright</key>
     <string>MIT License</string>
     <key>SUEnableInstallerLauncherService</key>

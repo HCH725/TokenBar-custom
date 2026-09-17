@@ -15,7 +15,15 @@ import Sparkle
 final class UpdaterService: NSObject, SPUUpdaterDelegate {
     static let shared = UpdaterService()
 
-    static var isAvailable: Bool { Bundle.main.bundleURL.pathExtension == "app" }
+    static var isBundled: Bool { Bundle.main.bundleURL.pathExtension == "app" }
+
+    /// Private derivative builds set this Info.plist flag to false so the
+    /// official Sparkle feed can never replace a custom production build.
+    static var officialUpdatesEnabled: Bool {
+        Bundle.main.object(forInfoDictionaryKey: "TokenBarOfficialUpdatesEnabled") as? Bool ?? true
+    }
+
+    static var isAvailable: Bool { isBundled && officialUpdatesEnabled }
 
     /// Display version of an available update (nil = up to date / unknown).
     private(set) var availableVersion: String?
@@ -72,7 +80,7 @@ final class UpdaterService: NSObject, SPUUpdaterDelegate {
 /// has no main-app service identity to register).
 @MainActor
 enum AutostartService {
-    static var isAvailable: Bool { UpdaterService.isAvailable }
+    static var isAvailable: Bool { UpdaterService.isBundled }
 
     nonisolated static func readEnabled() async -> Bool {
         await Task.detached(priority: .utility) {

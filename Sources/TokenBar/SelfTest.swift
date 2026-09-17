@@ -1367,12 +1367,16 @@ enum SelfTest {
         // participate in effective-state resolution.
         func attributionEntry(
             client: String, provider: String, model: String,
-            total: Int64 = 1, cost: Double = 0.0
+            total: Int64 = 1, cost: Double = 0.0,
+            listPriceEquivalentCost: Double? = nil
         ) -> ModelReportEntry {
+            let equivalent = listPriceEquivalentCost.map {
+                ",\"listPriceEquivalentCost\":\($0)"
+            } ?? ""
             let json = """
             {"client":"\(client)","model":"\(model)","provider":"\(provider)",
              "input":1,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,
-             "total":\(total),"messageCount":1,"cost":\(cost),"msPer1kTokens":null}
+             "total":\(total),"messageCount":1,"cost":\(cost)\(equivalent),"msPer1kTokens":null}
             """
             return try! JSONDecoder().decode(
                 ModelReportEntry.self, from: Data(json.utf8))
@@ -1535,6 +1539,24 @@ enum SelfTest {
                 && zeroCostBreakdown.map(\.tokens) == [11, 22, 33]
                 && zeroCostBreakdown.map(\.cost) == [0.0, 0.0, 0.0],
             "zero-cost tokens remain visible in every attribution bucket")
+
+        let codexEquivalentBreakdown = UsageAttributionBreakdown.rows(
+            entries: [
+                attributionEntry(
+                    client: "hermes", provider: "openai", model: "gpt-5.6-terra",
+                    total: 42, cost: 0.0, listPriceEquivalentCost: 0.38),
+            ],
+            clientIds: ["hermes"],
+            confirmed: [
+                UsageAttribution.Record(
+                    client: "hermes", provider: "openai", state: .assigned("codex")),
+            ])
+        expect(
+            codexEquivalentBreakdown.count == 1
+                && codexEquivalentBreakdown[0].state == .assigned("codex")
+                && codexEquivalentBreakdown[0].tokens == 42
+                && abs(codexEquivalentBreakdown[0].cost - 0.38) < 0.000_001,
+            "subscription-included Hermes Codex usage reports API-list-price equivalent instead of actual zero")
 
         let mergedBreakdown = UsageAttributionBreakdown.rows(
             entries: [
@@ -4524,6 +4546,83 @@ enum SelfTest {
                 && lastGoodRuntime?.accessibilityLabel.contains("last known") == true
                 && lastGoodRuntime?.toolTip.contains("timed out") == false,
             "explicit error fallback is labeled as last-known quota, not current data")
+
+        // DeepSeek Official is a currency balance, not a quota percentage: the
+        // amount is shown as money, the card exists with no local usage logs,
+        // and a payload that predates the additive field still decodes.
+        let balanceJSON = """
+        {"generatedAt":"now","agents":[
+          {"clientId":"deepseek","source":"api-key","updatedAt":"now","windows":[],
+           "balance":{"currency":"USD","total":3.41,"granted":1.0,"toppedUp":2.41,"isAvailable":true}}
+        ]}
+        """
+        let balancePayload = try! JSONDecoder().decode(
+            AgentUsagePayload.self, from: Data(balanceJSON.utf8))
+        expect(
+            balancePayload.agents.first?.balance?.total == 3.41
+                && balancePayload.agents.first?.balance?.granted == 1.0
+                && balancePayload.agents.first?.balance?.toppedUp == 2.41
+                && balancePayload.agents.first?.balance?.isAvailable == true
+                && quotaPayload.agents.allSatisfy { $0.balance == nil },
+            "a balance decodes only where the payload carries it")
+        let balanceRow = ClientTray.settingsRows(
+            presentClients: [], payload: balancePayload, enabled: [], selections: [:],
+            hidden: [], orderRaw: "",
+            officialClients: officialClientIDs).first
+        expect(
+            balanceRow?.clientId == "deepseek"
+                && balanceRow?.displayName == "DeepSeek Official"
+                && balanceRow?.valueText == "3.41"
+                && balanceRow?.accessibilityLabel.contains("3.41 USD") == true
+                && balanceRow?.accessibilityLabel.contains("1.00 granted") == true
+                && balanceRow?.accessibilityLabel.contains("2.41 topped up") == true,
+            "a payload-only balance client is configurable and reads as money")
+        let balanceRuntime = ClientTray.runtimePresentations(
+            graph: clientGraph, payload: balancePayload, enabled: ["deepseek"],
+            selections: [:], hidden: [], officialClients: officialClientIDs).first
+        expect(
+            balanceRuntime?.clientId == "deepseek"
+                && balanceRuntime?.status == .available
+                && balanceRuntime?.valueText == "3.41"
+                && balanceRuntime?.toolTip.contains("3.41 USD balance") == true
+                && balanceRuntime?.toolTip.contains("2.41 topped up") == true
+                && balanceRuntime?.toolTip.contains("%") == false
+                && balanceRuntime?.accessibilityLabel.contains("%") == false,
+            "the DeepSeek item shows its amount and never a fabricated percentage")
+        // The currency travels with the amount: the same 110 reads as yen, and
+        // an absent granted/topped-up split stays absent instead of zero.
+        let cnyBalance = try! JSONDecoder().decode(
+            AgentUsagePayload.self, from: Data("""
+            {"generatedAt":"now","agents":[
+              {"clientId":"deepseek","source":"api-key","updatedAt":"now","windows":[],
+               "balance":{"currency":"CNY","total":110,"isAvailable":true}}
+            ]}
+            """.utf8)).agents.first!.balance!
+        expect(
+            ClientTray.balanceValueText(cnyBalance) == "¥110.00"
+                && ClientTray.balanceSummary("DeepSeek Official", cnyBalance)
+                    == "DeepSeek Official — 110.00 CNY balance"
+                && ClientTray.balanceValueText(balancePayload.agents.first!.balance!) == "3.41",
+            "balance formatting follows the currency and omits unstated amounts")
+        // A transient failure serves the last-good balance; the card must say so
+        // rather than dropping it.
+        let staleBalancePayload = try! JSONDecoder().decode(
+            AgentUsagePayload.self, from: Data("""
+            {"generatedAt":"now","agents":[
+              {"clientId":"deepseek","source":"api-key","updatedAt":"now","windows":[],
+               "balance":{"currency":"USD","total":3.41,"isAvailable":true},
+               "error":"DeepSeek balance request failed. Retrying automatically."}
+            ]}
+            """.utf8))
+        let staleBalance = ClientTray.runtimePresentations(
+            graph: clientGraph, payload: staleBalancePayload, enabled: ["deepseek"],
+            selections: [:], hidden: [], officialClients: officialClientIDs).first
+        expect(
+            staleBalance?.valueText == "3.41"
+                && staleBalance?.status == .errorAuto
+                && staleBalance?.toolTip.contains("last known") == true
+                && staleBalance?.toolTip.contains("Retrying automatically") == false,
+            "a last-good balance is shown as last known, not as current data")
 
         // Rows must not depend on Set iteration order. With no saved tab order
         // and no payload, every row comes from the preserved-enabled path, which
@@ -11242,6 +11341,24 @@ enum SelfTest {
                 messages: windowMessages, undatedCount: 0, processingTimeMs: 0
             ).totals(confirmed: [crRecords[0]]).assigned.map(\.target) == ["wide"],
             "CR3 and the provider-wide one still applies when no override exists")
+
+        let codexWindowMessage = try! JSONDecoder().decode(
+            WindowMessage.self,
+            from: Data("""
+            {"timestamp":4000,"client":"hermes","providerId":"openai","modelId":"gpt-5.6-terra",
+             "input":42,"output":0,"cacheRead":0,"cacheWrite":0,"reasoning":0,
+             "cost":0,"listPriceEquivalentCost":0.38,"isTurnStart":true}
+            """.utf8))
+        let codexWindowTotals = WindowUsage(
+            messages: [codexWindowMessage], undatedCount: 0, processingTimeMs: 0
+        ).totals(confirmed: [
+            UsageAttribution.Record(
+                client: "hermes", provider: "openai", state: .assigned("codex")),
+        ])
+        expect(
+            codexWindowTotals.assigned.count == 1
+                && abs(codexWindowTotals.assigned[0].cost - 0.38) < 0.000_001,
+            "quota window attribution uses API-list-price equivalent while source actual cost remains zero")
 
         // CR7. The equivalence footer reads only the settled window. A sample
         // from the previous provider-anchored interval carries the earlier

@@ -315,16 +315,17 @@ public enum UsageAttributionSettings {
             // can still place them in different buckets and report both. Same
             // test at the same stage is one invariant; same test at two stages
             // is an invariant plus a standing obligation to remember it.
-            guard entry.total != 0 || entry.cost != 0 else { continue }
+            let equivalentCost = entry.listPriceEquivalentCost ?? entry.cost
+            guard entry.total != 0 || equivalentCost != 0 else { continue }
             let key = sourceKey(client: entry.client, provider: entry.provider)
             if let current = aggregate[key] {
                 aggregate[key] = (
                     current.client,
                     current.provider,
                     current.tokens.saturatingAdding(entry.total),
-                    current.cost + entry.cost)
+                    current.cost + equivalentCost)
             } else {
-                aggregate[key] = (entry.client, entry.provider, entry.total, entry.cost)
+                aggregate[key] = (entry.client, entry.provider, entry.total, equivalentCost)
                 order.append(key)
             }
         }

@@ -52,6 +52,7 @@ xcodebuild -project "$SRC/Sparkle.xcodeproj" -scheme Sparkle -configuration Rele
   -derivedDataPath "$OUT/dd" \
   -clonedSourcePackagesDirPath "$OUT/spm" \
   SPARKLE_NORMALIZE_INSTALLED_APPLICATION_NAME=1 \
+  MACOSX_DEPLOYMENT_TARGET=12.0 \
   ONLY_ACTIVE_ARCH=NO ARCHS="arm64 x86_64" \
   CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual DEVELOPMENT_TEAM="" \
   build >"$OUT/build.log" 2>&1 || { tail -40 "$OUT/build.log" >&2; exit 1; }

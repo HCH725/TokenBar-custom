@@ -54,7 +54,8 @@ public enum AttributedDailySeries {
         for contribution in contributions {
             for client in contribution.clients {
                 let tokens = client.tokens.total
-                guard tokens != 0 || client.cost != 0 else { continue }
+                let equivalentCost = client.attributionCost
+                guard tokens != 0 || equivalentCost != 0 else { continue }
 
                 let state: UsageAttribution.State
                 if client.providerId.contains(",") {
@@ -70,7 +71,7 @@ public enum AttributedDailySeries {
                     date: contribution.date,
                     state: state,
                     model: client.modelId)
-                rows.append(Row(key: key, tokens: tokens, cost: client.cost))
+                rows.append(Row(key: key, tokens: tokens, cost: equivalentCost))
             }
         }
 

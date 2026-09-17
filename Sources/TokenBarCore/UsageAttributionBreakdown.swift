@@ -41,18 +41,19 @@ public enum UsageAttributionBreakdown {
 
         for entry in entries where allowed.contains(entry.client) {
             let state = UsageAttribution.resolve(entry, records: confirmed)
-            guard entry.total != 0 || entry.cost != 0 else { continue }
+            let equivalentCost = entry.listPriceEquivalentCost ?? entry.cost
+            guard entry.total != 0 || equivalentCost != 0 else { continue }
             switch state {
             case let .assigned(target):
                 let current = assigned[target] ?? (0, 0)
                 assigned[target] = (
-                    current.tokens.saturatingAdding(entry.total), current.cost + entry.cost)
+                    current.tokens.saturatingAdding(entry.total), current.cost + equivalentCost)
             case .excluded:
                 excluded.tokens = excluded.tokens.saturatingAdding(entry.total)
-                excluded.cost += entry.cost
+                excluded.cost += equivalentCost
             case .unassigned:
                 unassigned.tokens = unassigned.tokens.saturatingAdding(entry.total)
-                unassigned.cost += entry.cost
+                unassigned.cost += equivalentCost
             }
         }
 

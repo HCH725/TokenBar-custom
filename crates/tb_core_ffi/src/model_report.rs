@@ -25,6 +25,7 @@ struct ModelEntry {
     total: i64,
     message_count: i32,
     cost: f64,
+    list_price_equivalent_cost: f64,
     /// Milliseconds per 1K tokens, when tokscale could time the model. `None`
     /// when no message in the rollup carried a usable duration.
     ms_per_1k_tokens: Option<f64>,
@@ -215,6 +216,7 @@ fn map_report(
                     total,
                     message_count: e.message_count,
                     cost: e.cost,
+                    list_price_equivalent_cost: e.list_price_equivalent_cost,
                     ms_per_1k_tokens: e.performance.ms_per_1k_tokens,
                     cost_estimate,
                 }
@@ -591,6 +593,7 @@ mod tests {
             reasoning,
             message_count: 1,
             cost: 0.0,
+            list_price_equivalent_cost: 0.0,
             performance: tokscale_core::ModelPerformance::default(),
         }
     }
