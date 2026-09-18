@@ -9,8 +9,8 @@ repository as a Git submodule; that repository tracks the public `Nanako0129/tok
 |---|---|
 | Path | `vendor/tokscale-core` |
 | Repository | `https://github.com/HCH725/tokscale-core-custom.git` |
-| Reviewed pin | `dad446d40dfd90ddfb049f9f2d10d1ae20c9baad` |
-| Upstream and local-patch ledger | Immutable [`UPSTREAM.md`](https://github.com/HCH725/tokscale-core-custom/blob/dad446d40dfd90ddfb049f9f2d10d1ae20c9baad/UPSTREAM.md) plus private contract [`CUSTOM.md`](https://github.com/HCH725/tokscale-core-custom/blob/dad446d40dfd90ddfb049f9f2d10d1ae20c9baad/CUSTOM.md) |
+| Reviewed pin | `dad446ddea70a6c751c1eb338c5c03112df83af6` |
+| Upstream and local-patch ledger | Immutable [`UPSTREAM.md`](https://github.com/HCH725/tokscale-core-custom/blob/dad446ddea70a6c751c1eb338c5c03112df83af6/UPSTREAM.md) plus private contract [`CUSTOM.md`](https://github.com/HCH725/tokscale-core-custom/blob/dad446ddea70a6c751c1eb338c5c03112df83af6/CUSTOM.md) |
 
 ## Ownership
 

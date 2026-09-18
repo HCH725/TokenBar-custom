@@ -85,7 +85,7 @@ docs/knowledge/
 
 | Source | Authority |
 |---|---|
-| Private canonical [`tokscale-core-custom/UPSTREAM.md`](https://github.com/HCH725/tokscale-core-custom/blob/dad446d40dfd90ddfb049f9f2d10d1ae20c9baad/UPSTREAM.md) + [`CUSTOM.md`](https://github.com/HCH725/tokscale-core-custom/blob/dad446d40dfd90ddfb049f9f2d10d1ae20c9baad/CUSTOM.md) | Exact reviewed shared-engine upstream baseline and private contract for the current Native consumer pin |
+| Private canonical [`tokscale-core-custom/UPSTREAM.md`](https://github.com/HCH725/tokscale-core-custom/blob/dad446ddea70a6c751c1eb338c5c03112df83af6/UPSTREAM.md) + [`CUSTOM.md`](https://github.com/HCH725/tokscale-core-custom/blob/dad446ddea70a6c751c1eb338c5c03112df83af6/CUSTOM.md) | Exact reviewed shared-engine upstream baseline and private contract for the current Native consumer pin |
 | `vendor/README.md` | TokenBar's shared-engine repository and reviewed consumer pin |
 | `.github/workflows/*.yml` | Runtime CI, Pages, release, and install-count gates |
 | `Makefile` | Local build order and stale Rust static-library relink guard |
