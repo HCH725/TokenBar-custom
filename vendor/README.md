@@ -1,16 +1,16 @@
 # Shared Rust core pin
 
-TokenBar consumes the public
-[`Nanako0129/tokscale-core`](https://github.com/Nanako0129/tokscale-core)
-repository as a Git submodule. Consumer integration rules are documented in
+TokenBar consumes the private canonical
+[`HCH725/tokscale-core-custom`](https://github.com/HCH725/tokscale-core-custom)
+repository as a Git submodule; that repository tracks the public `Nanako0129/tokscale-core` baseline. Consumer integration rules are documented in
 [`docs/knowledge/vendor-tokscale.md`](../docs/knowledge/vendor-tokscale.md).
 
 | Field | Value |
 |---|---|
 | Path | `vendor/tokscale-core` |
-| Repository | `https://github.com/Nanako0129/tokscale-core.git` |
-| Reviewed pin | `d6512f5ae62c2be6751ed93adb9391ffe3f91579` |
-| Upstream and local-patch ledger | Immutable [`UPSTREAM.md`](https://github.com/Nanako0129/tokscale-core/blob/d6512f5ae62c2be6751ed93adb9391ffe3f91579/UPSTREAM.md) |
+| Repository | `https://github.com/HCH725/tokscale-core-custom.git` |
+| Reviewed pin | `dad446d40dfd90ddfb049f9f2d10d1ae20c9baad` |
+| Upstream and local-patch ledger | Immutable [`UPSTREAM.md`](https://github.com/HCH725/tokscale-core-custom/blob/dad446d40dfd90ddfb049f9f2d10d1ae20c9baad/UPSTREAM.md) plus private contract [`CUSTOM.md`](https://github.com/HCH725/tokscale-core-custom/blob/dad446d40dfd90ddfb049f9f2d10d1ae20c9baad/CUSTOM.md) |
 
 ## Ownership
 
@@ -28,7 +28,7 @@ commit and run the TokenBar consumer gates.
 Clone recursively:
 
 ```bash
-git clone --recurse-submodules https://github.com/Nanako0129/TokenBar.git
+git clone --recurse-submodules https://github.com/HCH725/TokenBar-custom.git
 ```
 
 For an existing checkout:
