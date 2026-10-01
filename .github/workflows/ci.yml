@@ -68,9 +68,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
-            git fetch --unshallow --quiet origin
+            git -c fetch.recurseSubmodules=false fetch --unshallow --quiet origin
           fi
-          git fetch --quiet origin +refs/heads/main:refs/remotes/origin/main
+          git -c fetch.recurseSubmodules=false fetch --quiet origin +refs/heads/main:refs/remotes/origin/main
           test "$(git rev-parse --is-shallow-repository)" = "false"
           git merge-base origin/main HEAD >/dev/null
 
