@@ -4,15 +4,15 @@ id: kb-workflow
 kind: canonical
 scope: repository
 read_when: creating a branch, reviewing a change, touching external contributions, or preparing integration
-last_verified: 2026-09-15
-sources: ["AGENTS.md", ".github/workflows/ci.yml", ".github/workflows/release.yml", "vendor/README.md", "public GitHub contribution history"]
+last_verified: 2026-09-27
+sources: ["AGENTS.md", ".github/workflows/ci.yml", ".github/workflows/ci-release.yml", ".github/workflows/release.yml", "vendor/README.md", "public GitHub contribution history"]
 ---
 
 # Engineering workflow and authorization
 
 ## 文件目的
 
-這份文件定義 TokenBar 的 worktree、branch、review、checkpoint、外部貢獻與 integration 邊界。它把「可以實作」與「可以改變遠端或主線狀態」分開，讓每次 handoff 都保留可審查證據。
+這份文件定義 Syrtis 的 worktree、branch、review、checkpoint、外部貢獻與 integration 邊界。它把「可以實作」與「可以改變遠端或主線狀態」分開，讓每次 handoff 都保留可審查證據。
 
 ## 目錄
 

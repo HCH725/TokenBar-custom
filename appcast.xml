@@ -3,116 +3,109 @@
     <channel>
         <title>TokenBar updates</title>
         <item>
-            <title>1.17.0</title>
-            <pubDate>Thu, 10 Sep 2026 06:50:35 +0000</pubDate>
-            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.17.0</link>
-            <sparkle:version>994</sparkle:version>
-            <sparkle:shortVersionString>1.17.0</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <description><![CDATA[<b>Before you update:</b>
-<ul>
-<li>Reported costs move up, reported tokens move down, and neither is a change to what you actually spent. Four corrections land together, and they are not the same kind of thing. Only one changes a rate. Two were double counts, which is why some figures fall while the cost rises; the fourth was not a pricing error at all.</li>
-<li>The rate: one-hour prompt-cache writes were billed at the five-minute rate. Anthropic charges 1.25x base input for a five-minute cache write and 2x for a one-hour one, and the transcript reports both under a single total. TokenBar read only that total and priced all of it at the cheaper rate. It now reads the split. Measured over 1,144 local Claude transcripts, the one-hour TTL is 79.6% of cache-write tokens and total cost rises 7.18% - TokenBar stopped under-charging rather than starting to over-charge. Token counts are unchanged; only the price attached to them moved.</li>
-<li>Counted twice: tool_result text. The parser estimated input tokens for a tool result at one per four characters, and then the next assistant turn reported the same text again in its own usage. Reported Claude input tokens fall, by an amount that varies enormously with how tool-heavy the usage is: -5.9% over those same 1,144 transcripts, -91.9% over a contributor's 6,219. Output, cache reads and cache writes are byte-identical in both.</li>
-<li>Counted twice: Codex reasoning tokens. Codex reports its reasoning tokens as a subset of the output tokens it already reported, and TokenBar added them on top of that output instead of inside it, so every reasoning token was billed twice. Historical Codex costs fall in proportion to reasoning effort - around 6% on one local Codex corpus, more for an account that runs high effort throughout. Nothing was deleted; the same tokens are counted once.</li>
-<li>Not stable: a historical cost could change on its own, and now cannot. When several pricing entries matched a model equally well, the one used was whichever the lookup table happened to iterate first, and that order changed every time the table reloaded. The same usage could be priced one way today and another tomorrow with nothing new behind it. Two hundred runs against a fixed table returned two different answers - 117 runs one way, 83 the other. Ties are now broken deterministically, so an affected model settles once and stops moving.</li>
-<li>The first launch after updating re-scans every transcript once. The cache format changed, and only Claude's entries can be carried across it, so every other agent's cached parse is rebuilt from source. On 3.0 GB of Codex logs and 2.4 GB of Claude logs that took 18-28 seconds, against 1-4 seconds warm. It happens once. The dashboard also opens on a loading state rather than the previous chart, for that launch only. Claude's history survives the rebuild instead of being discarded, including turns a compaction has already removed from the transcript, where the cache is the only remaining copy.</li>
-</ul>
-<b>Fixes:</b>
-<ul>
-<li>The two Codex Spark quota windows were both called "Codex Spark". Codex reports its five-hour and seven-day Spark limits under one name, and TokenBar named each window after the limit it came from, so the window picker, the limits card, the Settings menu and the menu-bar source list each offered two entries that could not be told apart. Each window is now qualified by evidence it actually carries: its length where that is known - Codex Spark - Session and Codex Spark - Weekly - otherwise its own reset time, otherwise a number. Nothing that was already unique is renamed.</li>
-<li>Codex windows with no usage yet showed no pace and no duration. A provider's reply was checked against a clock read before the request went out, so the evidence was always one round trip stale. For a window Codex reports as unused, the reset it returns sits a full window ahead of its clock, which put the window's start in the future of that stale reading - by about a second, which was enough. The reply was rejected as invalid, and the duration, window length and pace went with it; those rows read "No pace data - quota data invalid". The clock is now read after the reply arrives. Windows that were blank get their pace back, and start accumulating quota history from here.</li>
-<li>Window history stayed on "Reading local usage..." indefinitely. The history card scanned a range anchored to the live window, so when the provider stopped supplying a duration there was no anchor, the scan returned nothing, and every row sat on its loading message. The cycle itself now counts as a valid range. The two problems are independent, so this holds even if a provider degrades again.</li>
-</ul>
-]]></description>
-            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.17.0/TokenBar.app.tar.gz" length="10302414" type="application/octet-stream" sparkle:edSignature="sVoaxNg1eNQvImZMZnxcJKIFJ43T3lx/vvUl1MCmwR+G+D8abwJsBWmBkeJwoMbKn0eTuYuMGB+kIITn/rUsBw=="/>
-        </item>
-        <item>
-            <title>1.16.0</title>
-            <pubDate>Sat, 05 Sep 2026 19:19:32 +0000</pubDate>
-            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.16.0</link>
-            <sparkle:version>935</sparkle:version>
-            <sparkle:shortVersionString>1.16.0</sparkle:shortVersionString>
+            <title>2.1.0</title>
+            <pubDate>Sun, 27 Sep 2026 19:43:56 +0000</pubDate>
+            <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.1.0</link>
+            <sparkle:version>1366</sparkle:version>
+            <sparkle:shortVersionString>2.1.0</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
             <description><![CDATA[<b>Features:</b>
 <ul>
-<li>TokenBar speaks Simplified Chinese. 简体中文 joins English and 繁體中文 under Settings > Language. The catalog covers 488 strings: tabs, dashboard cards, quota windows, statistics, charts, contribution tooltips, settings, and the menu-bar item. As with the other two languages, the choice takes effect on the next launch, because macOS resolves the interface language once at startup. It is reviewed copy rather than a character conversion of the Traditional Chinese catalog: terminology, counters and word order were adapted, and a sentence Chinese reorders is translated as one unit rather than assembled from parts. Some values are built while the app runs - window titles, the pagination line, token totals, streak lengths, the usage-loading error - and those never reached the translation table at all. They do now, in every language.</li>
+<li>A card offers to attribute your usage to subscriptions. Until usage is attributed, a subscription's window history lists 0 tokens and $0.00 for every window. When nothing is attributed yet, a card at the top of Overview and of the Quota view on every client tab lists the suggested assignments and applies them in one click; "Set up manually…" opens Settings → Usage attribution, and "Not now" hides the card for good.</li>
+<li>Grok Build models are listed under one name. grok-4.6-build and grok-4.6 were two rows for one model; Models, Monthly, Daily and the Grok quota card now list grok-4.6 and grok-4.7 once each. Totals are unchanged.</li>
+<li>The menu bar gauge turns grey once the reading it shows is more than 30 minutes old, and takes its color back with the next fresh reading.</li>
 </ul>
 <b>Fixes:</b>
 <ul>
-<li>Each menu-bar color swatch now opens its own editor. The Font color section that arrived in 1.15.0 shows three swatches - normal, low, very low - and all three shared a single popover anchored to the row containing them. Whichever swatch you clicked, the editor's arrow pointed at the middle one. Each swatch now anchors its own.</li>
-<li>Three Traditional Chinese strings were still falling back to English. The usage-loading error, the "show more" pagination line and the OAuth quota label had no Traditional Chinese entries. Both Chinese catalogs now carry the same 488 keys.</li>
+<li>Setting the clock back could erase quota history. Loading dropped a whole series when it held readings stamped later than the current time, and a poll that recorded anything then saved the loss. With the clock set back 10 minutes on a copy of a real history file, the previous version dropped 10,163 readings to 3,780 in memory; this version drops only the 4 readings stamped in the future. Repairs made while loading are now written back once.</li>
+<li>The window history said "Quota history could not be read. It will be retried." for good for sources that record no history, such as Antigravity read through agy. It now shows that no earlier windows are recorded.</li>
+<li>Model prices stopped updating while you were idle. While the dashboard is open, the model report is now fetched again once it is an hour old.</li>
+<li>A signed-in agy that Syrtis could not find started a login shell on every refresh. It now runs at most once every 15 minutes.</li>
+<li>Claude credential errors now name their cause, and none includes credential content. A Keychain credential with a character outside printable ASCII is now read.</li>
+<li>A malformed Codex token could skip the refresh check; its expiry is no longer trusted. Thanks @snowman12320.</li>
+<li>Quota history that failed to load was described as never recorded; Past windows and the heatmap now say it could not be read and will be retried.</li>
+<li>On macOS 27 in light mode, the separators in the glass panel are lighter.</li>
 </ul>
-<p>Thanks: @Agugu-official</p>
+<p>Thanks: @snowman12320</p>
 ]]></description>
-            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.16.0/TokenBar.app.tar.gz" length="10186129" type="application/octet-stream" sparkle:edSignature="Dkux+tyVDNs2ZL6d7l/7ISp3QozMP6uvzbMMOziJH47HGFPWrSPhqn+khj7g7s0VnEFdaREgJJgPFI5tdexUDA=="/>
+            <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.1.0/Syrtis.app.tar.gz" length="11370210" type="application/octet-stream" sparkle:edSignature="loZMq4/PHlAPjeawqyE1j0A78qHzJz8CpdeQtxwrobcTBmxk/tTjgMt+0JHVIaYsxGhkj9UEsvQyZMptTK9gCQ=="/>
         </item>
         <item>
-            <title>1.15.0</title>
-            <pubDate>Fri, 04 Sep 2026 13:20:12 +0000</pubDate>
-            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.15.0</link>
-            <sparkle:version>921</sparkle:version>
-            <sparkle:shortVersionString>1.15.0</sparkle:shortVersionString>
+            <title>2.0.1</title>
+            <pubDate>Sat, 26 Sep 2026 20:16:43 +0000</pubDate>
+            <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.0.1</link>
+            <sparkle:version>1248</sparkle:version>
+            <sparkle:shortVersionString>2.0.1</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <description><![CDATA[<b>Fixes:</b>
+<ul>
+<li>Hover tooltips in the glass panel were hard to read over a list. On macOS 27 the tooltips used clear glass, which barely blurs what is behind it, so over the window history the rows beneath showed through the tooltip's own figures. The tooltips now use the same frosted glass as the panel.</li>
+</ul>
+]]></description>
+            <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.0.1/Syrtis.app.tar.gz" length="11057571" type="application/octet-stream" sparkle:edSignature="7xDdl8fZXkMbjtX+7pH4vj1IYkG6IfrgEOaAaBZR95nVA3yvjgowZVXpHpuqSoAfqZXtDgg7c0j3ynlZCeJqCA=="/>
+        </item>
+        <item>
+            <title>2.0.0</title>
+            <pubDate>Sat, 26 Sep 2026 03:39:03 +0000</pubDate>
+            <link>https://github.com/Nanako0129/syrtis/releases/tag/v2.0.0</link>
+            <sparkle:version>1242</sparkle:version>
+            <sparkle:shortVersionString>2.0.0</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
             <description><![CDATA[<b>Before you update:</b>
 <ul>
-<li>The "10% of quota ~ ..." line will read lower on some windows, and that is the fix. That line divides the usage recorded during a window by how much quota the window consumed, and it was measuring that consumption two different ways depending on where the line appeared: the single-window row took the distance between the first and the last reading, and the pooled historical estimate took the gap between the highest and the lowest. When a reading goes down - a reset, or the provider correcting a number it reported earlier - the first collapses while the second stops at whatever the highest reading happened to be, and the usage above the line still counts everything on both sides of the drop either way. Both now count the distance the readings actually travelled. On one real window that is 95 points, against 10 by the old single-window measure and 85 by the old pooled one, so the single-window row was dividing a full window of usage by 10 while the pooled estimate was only slightly high. Only windows whose readings went down at some point are affected; where the readings only rose, the two measurements are the same number and nothing changes. Nothing was lost and nothing needs rebuilding.</li>
+<li>TokenBar is now Syrtis, and the first launch renames the app on disk. The update installs over TokenBar.app; on its first launch the app renames itself to Syrtis.app in the same folder and starts again from there. The bundle identifier has not changed, so settings, usage history and the login item carry over. If TokenBar.app is pinned in the Dock, the tile is repointed at Syrtis.app and the Dock restarts once: windows you had minimized to the Dock leave it (clicking their app brings them back), and the pinned tile may keep the old icon until you click it once. The rename is skipped when a Syrtis.app already sits beside it, or when the account cannot write to the Applications folder; the app then keeps the name TokenBar.app and works the same.</li>
+<li>Homebrew has a new tap. New installs use brew install --cask nanako0129/tap/syrtis. An existing install from nanako0129/tokenbar keeps updating through the app itself; that cask stays on the last TokenBar release.</li>
+<li>Some clients re-scan once, and two of them count differently. Copilot, Grok, OpenClaw, RooCode, KiloCode, Cline, Cursor, OpenCode, Pi and Droid each rebuild their cache once on the first launch; every other client, Claude and Codex included, is read from its existing cache. Pi counts fall if you fork sessions: a forked session's copied replies were counted again, and each reply now counts once. OpenClaw counts can move either way: archived sessions are now read, and compaction checkpoints are no longer counted as usage. Droid totals are unchanged, now split across a session's replies.</li>
 </ul>
 <b>Features:</b>
 <ul>
-<li>The menu-bar text color is configurable. Settings gains a Font color section under Menu bar, offering Automatic and Custom. Automatic is unchanged: quota remaining keeps the built-in green / amber / red, and other titles keep the system color. Custom sets three colors of your own against the thresholds the gauge already uses - above 25% remaining, above 10% through 25%, and 10% or below - with 16 presets and a #RRGGBB field. Each individual client item uses its own remaining value. Switching back to Automatic keeps all three colors for later.</li>
-<li>A reported cost the local pricing table cannot justify is now flagged. Some clients record their own per-message cost, which TokenBar ships as reported rather than pricing the tokens itself, so a unit error upstream reaches the screen with nothing in between. One report showed a model at $8,647 for 74M tokens. Such a row now carries an amber warning beside the cost, and the tooltip names the multiple it is of the local estimate. The figure itself is not corrected. The threshold is 50x, so a normal row cannot reach it, and a model the table cannot price produces no flag rather than a false one.</li>
+<li>On macOS 27, the dashboard opens in a Liquid Glass panel whose glass refracts the actual wallpaper. It closes on Esc or a click anywhere else, and right-clicking the menu bar item still opens the menu. Below macOS 27 the popover is unchanged.</li>
+<li>A new icon and name in the app: the Syrtis mark and the Greek wordmark in the panel header and Settings, and the new icon in Discord presence. The site is now syrtis.nyanako.com; old TokenBar links redirect.</li>
 </ul>
 <b>Fixes:</b>
 <ul>
-<li>With a second Claude account, each account's usage was counted against every account's quota. Every quota-window surface folded both accounts' transcripts into whichever account's allowance it was dividing by. Measured against a reporting store, the primary account's figures ran 1.40x high and the second account's 3.51x, the smaller account being hit harder because it receives the same numerator against much less quota movement. Each account is now scanned separately, against its own registered root. Single-account installs are unaffected, and no stored data changes format. Two limits are left in place rather than papered over: a transcript sitting under both accounts' roots is counted for both, because nothing in it says which account produced it, measured at 2 messages in 10,389 on the machine this was built against; and usage you attributed to Claude from another client stays with the primary account, because an attribution names a client, a provider and a model and carries no account for it to follow.</li>
-<li>Consumption measured across a drop now has to clear the estimate's bar once per rise. This is the other half of the same correction. Usage summed across a drop is several separate measurements added together, each carrying its own rounding, so the quoted plus-or-minus is now one rounding step per rise over the whole consumption rather than one step over the displacement. It can come out either narrower or wider than the figure you saw before, depending on which of the two moved more. A window with enough movement still gets its estimate; one that no longer clears the bar reads "too little to estimate" instead of a confident number.</li>
-<li>The Models list now shows the same detailed hover tooltip as the other cards. It already had a plain one naming the model and its client; the shared tooltip adds the token breakdown and the cost, and it is where the cost warning above names its multiple.</li>
+<li>A quota window's readings were deleted when they could not be modelled, for example after a provider moved a reset later. They are now kept, and still do not feed the pace model.</li>
+<li>Codex asked you to sign in again while a refresh token was available. The access token's own expiry is now checked, and it is refreshed within five minutes of it.</li>
+<li>Switching windows on the quota window card paused the app for 131-144 ms. It now takes 12-15 ms.</li>
+<li>Opening the dashboard right after launch computed the usage graph up to three times. It is now computed once.</li>
+<li>The Local Network prompt now explains that Syrtis connects to your providers to read quota information.</li>
 </ul>
-<p>Thanks: @Agugu-official</p>
+<p>Thanks: @mvanhorn, @snowman12320</p>
 ]]></description>
-            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.15.0/TokenBar.app.tar.gz" length="10155107" type="application/octet-stream" sparkle:edSignature="iEkLUx39Wu1L88is0YwWamAkATgbE0rb1IZw35Kt+GuCedfDVfbu2xRPxaEyU0+df7VXHRY5Deh4iHMm85N5Bw=="/>
+            <enclosure url="https://github.com/Nanako0129/syrtis/releases/download/v2.0.0/Syrtis.app.tar.gz" length="11057568" type="application/octet-stream" sparkle:edSignature="WXuw7zM9/4z/a2eFwSbYvyYj0YLtxaFowld8wofEMfRO8ia0Del7OIn4yKNjnYy0JUxDY1yRuSVfD6+LOetpCQ=="/>
         </item>
         <item>
-            <title>1.14.4</title>
-            <pubDate>Sun, 30 Aug 2026 11:21:49 +0000</pubDate>
-            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.14.4</link>
-            <sparkle:version>892</sparkle:version>
-            <sparkle:shortVersionString>1.14.4</sparkle:shortVersionString>
+            <title>1.20.2</title>
+            <pubDate>Thu, 24 Sep 2026 02:27:15 +0000</pubDate>
+            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.20.2</link>
+            <sparkle:version>1171</sparkle:version>
+            <sparkle:shortVersionString>1.20.2</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
             <description><![CDATA[<b>Fixes:</b>
 <ul>
-<li>Codex quota windows that ended before their advertised reset were deleted instead of recorded. Codex moves its reported weekly reset ahead of schedule, and a window that ended early was neither complete nor the one in progress, so the next save dropped it. On one account's raw sample log the reset moved on 11.6% of consecutive readings, which is why Codex window history stayed near empty while other providers filled in normally. Such a window is now closed at the length it actually ran, and appears in Window history like any other.</li>
-</ul>
-<b>Three limits worth knowing:</b>
-<ul>
-<li>Closing a window does not lower the bar for recording one. It still needs readings spread from near its start to near its end without a long gap, so a window seen only in patches is dropped exactly as before. If TokenBar was not running for much of a window, that window is still lost.</li>
-<li>History lost before this update does not come back. Those samples were deleted at the time, so nothing remains to rebuild from.</li>
-<li>A window cut short by more than a tenth of its length stays out of the pace projection, since one that stopped at 34% used would teach the run-out forecast that a full cycle ends there. A window that still ran nine tenths of its length counts as finished and feeds the projection as before.</li>
+<li>With the Antigravity CLI signed out, TokenBar could open a Google sign-in page on every refresh. When the Antigravity IDE is closed and no Gemini CLI login is available, TokenBar asks the agy CLI for quota instead. Signed out, that command opens a browser tab for Google sign-in and waits, and TokenBar ran it on every refresh: once a minute with the popover open. TokenBar now checks that agy's login item exists in the Keychain before running it, and skips the CLI when it does not. Only the item's presence and modification date are read, never the token. If agy runs and still fails, it is not run again until you sign in to agy again or restart TokenBar; until then the Antigravity card shows the error from the other routes.</li>
 </ul>
 ]]></description>
-            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.14.4/TokenBar.app.tar.gz" length="10048231" type="application/octet-stream" sparkle:edSignature="69h5qmXt6u+GD86iVzNiz9OEtkOrzBeSIu5wfrar6AshIxMDxFP11C11ilUbuaPj7rxQdZNWhUdJNMys22z5DA=="/>
+            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.20.2/TokenBar.app.tar.gz" length="10610828" type="application/octet-stream" sparkle:edSignature="V5Ad7443omy3/TpUJ0aszZFaMZV55rDFI5BcX3mbNPVtS43C3ROaCyzlyFmGJhDvxog8jD+nKHtnKkCrNsfqBQ=="/>
         </item>
         <item>
-            <title>1.14.3</title>
-            <pubDate>Tue, 25 Aug 2026 12:02:01 +0000</pubDate>
-            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.14.3</link>
-            <sparkle:version>859</sparkle:version>
-            <sparkle:shortVersionString>1.14.3</sparkle:shortVersionString>
+            <title>1.20.1</title>
+            <pubDate>Tue, 22 Sep 2026 20:17:43 +0000</pubDate>
+            <link>https://github.com/Nanako0129/TokenBar/releases/tag/v1.20.1</link>
+            <sparkle:version>1166</sparkle:version>
+            <sparkle:shortVersionString>1.20.1</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
             <description><![CDATA[<b>Fixes:</b>
 <ul>
-<li>Grok weekly usage now reads the whole weekly credit pool instead of the command-line tool's share of it, so an exhausted subscription no longer shows credit remaining. If you also use Grok outside the CLI, the weekly quota shown as remaining drops once after this update, and used rises to match — the old figure was overstating what was left, and nothing new was consumed.</li>
-<li>Grok weekly pace history starts over for the same reason. Samples recorded before this update measured the old per-product share, so keeping them would make run-out forecasts fit two different quantities. It rebuilds over the next few cycles; the monthly meter and your saved window selection are unchanged.</li>
-<li>Token counts just below a unit no longer render as "1000M" or "1000K". A count between 999.5M and 1B now reads 1B, and one between 999.5K and 1M reads 1M. Counts outside those two bands are unchanged.</li>
+<li>A model with no price read $0.00, the same as free usage. A row that shows a token count beside an amount now shows a dash when those tokens could not be priced. That happens when a model is not in the pricing data yet: Claude Opus 5.5 read $0.00 until LiteLLM and OpenRouter listed it on 2026-09-22. The Models tab, the model breakdown, Agents, the Daily and Monthly rows, the usage chart, the heatmap and the usage attribution rows all follow this. In the same places, a positive amount under half a cent now reads &lt;$0.01 instead of $0.00. Totals shown without a token count beside them are unchanged, and they still count unpriced usage as nothing.</li>
 </ul>
 ]]></description>
-            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.14.3/TokenBar.app.tar.gz" length="10041793" type="application/octet-stream" sparkle:edSignature="w3UUpMpARqDSNDr0qQOnYmEr5gZrxleQtNmD2Q2uw/jh4K9c8AyvB++dNCCsM8/pmNquG9Bn3S5c0MIj+q/fCg=="/>
+            <enclosure url="https://github.com/Nanako0129/TokenBar/releases/download/v1.20.1/TokenBar.app.tar.gz" length="10610511" type="application/octet-stream" sparkle:edSignature="BuCPLAh0fYZ1CCUzRX7PnCqBq7Qp6srk1cgJ8G2iSMmAZ4MEZFAGVWcnbT2zOp0f9ax1L33mvCvnf6FFOH5wAQ=="/>
         </item>
         <item>
             <title>1.1.1</title>

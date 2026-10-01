@@ -14,11 +14,11 @@
 #
 # generate_appcast authors item fields from the bundle's Info.plist, so the one
 # thing it does not produce is our release notes; we render them to an
-# HTML sidecar named after the archive (TokenBar.app.html) and pass
+# HTML sidecar named after the archive (Syrtis.app.html) and pass
 # --embed-release-notes so they land in the item's <description> CDATA.
 set -euo pipefail
 
-ARCHIVE="$1"        # freshly built TokenBar.app.tar.gz
+ARCHIVE="$1"        # freshly built Syrtis.app.tar.gz
 VERSION="$2"
 TAG="$3"            # git tag, e.g. v1.1.2 — used for the per-release download URL
 KEY_FILE="$4"
@@ -26,8 +26,8 @@ NOTES_FILE="${5:-}"
 
 GENERATE_APPCAST=".build/artifacts/sparkle/Sparkle/bin/generate_appcast"
 REPO_APPCAST="appcast.xml"
-ARCHIVE_BASENAME=$(basename "$ARCHIVE")                  # TokenBar.app.tar.gz
-NOTES_BASENAME="${ARCHIVE_BASENAME%.tar.gz}.html"        # TokenBar.app.html
+ARCHIVE_BASENAME=$(basename "$ARCHIVE")                  # Syrtis.app.tar.gz
+NOTES_BASENAME="${ARCHIVE_BASENAME%.tar.gz}.html"        # Syrtis.app.html
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -38,26 +38,12 @@ trap 'rm -rf "$WORK"' EXIT
 
 cp "$ARCHIVE" "$WORK/$ARCHIVE_BASENAME"
 
-# Render the plain-text notes (restricted format: "New:"/"Fixes:" headings,
-# "- " bullets) into simple HTML beside the archive; generate_appcast embeds a
-# same-base-name HTML sidecar as this item's <description>.
+# Render the plain-text notes beside the archive; generate_appcast embeds a
+# same-base-name HTML sidecar as this item's <description>. The renderer and
+# its escaping live in render_notes_html.sh so they can be tested on their own.
+# The guard stays here: an empty sidecar would become an empty <description>.
 if [[ -n "$NOTES_FILE" && -s "$NOTES_FILE" ]]; then
-  awk '
-    function esc(t) { gsub(/&/, "\\&amp;", t); gsub(/</, "\\&lt;", t); return t }
-    /^- / {
-      if (!inlist) { print "<ul>"; inlist = 1 }
-      print "<li>" esc(substr($0, 3)) "</li>"
-      next
-    }
-    {
-      if (inlist) { print "</ul>"; inlist = 0 }
-      if ($0 ~ /^[[:space:]]*$/) next
-      t = esc($0)
-      if (t ~ /:[[:space:]]*$/) print "<b>" t "</b>"
-      else print "<p>" t "</p>"
-    }
-    END { if (inlist) print "</ul>" }
-  ' "$NOTES_FILE" > "$WORK/$NOTES_BASENAME"
+  "$(dirname "$0")/render_notes_html.sh" "$NOTES_FILE" "$WORK/$NOTES_BASENAME"
 fi
 
 # Stable releases stay channel-less (served to everyone, so the latest stable is
@@ -74,8 +60,8 @@ esac
 
 "$GENERATE_APPCAST" \
   --ed-key-file "$KEY_FILE" \
-  --download-url-prefix "https://github.com/Nanako0129/TokenBar/releases/download/$TAG/" \
-  --link "https://github.com/Nanako0129/TokenBar/releases/tag/$TAG" \
+  --download-url-prefix "https://github.com/Nanako0129/syrtis/releases/download/$TAG/" \
+  --link "https://github.com/Nanako0129/syrtis/releases/tag/$TAG" \
   --embed-release-notes \
   --maximum-versions 5 \
   $CHANNEL_ARG \

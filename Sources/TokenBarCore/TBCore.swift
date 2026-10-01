@@ -356,6 +356,13 @@ public enum TBCore {
         try unwrap(tb_usage_trace(windowSecs))
     }
 
+    /// The quota provider ids, in card order, from the engine's single
+    /// registration table. Offline and cheap.
+    public static func quotaProviderIds() throws -> [String] {
+        let payload: QuotaProviderIds = try unwrap(tb_quota_provider_ids())
+        return payload.ids
+    }
+
     /// Live tokens/min estimate (10-minute-window average).
     public static func tokensPerMin() throws -> Double {
         let payload: TokensPerMin = try unwrap(tb_tokens_per_min())
@@ -466,7 +473,7 @@ public enum TBCore {
     }
 
     /// Hermetic checks for the FFI envelope/error contract, surfaced to the
-    /// `--selftest` runner (which lives in the TokenBar module and can't reach
+    /// `--selftest` runner (which lives in the Syrtis module and can't reach
     /// these internal symbols). Exercises the error paths `--smoke` never hits on
     /// live data: an `{"ok":false}` must throw `bridge`, a malformed body must
     /// throw rather than crash. Returns `(label, passed)` pairs.

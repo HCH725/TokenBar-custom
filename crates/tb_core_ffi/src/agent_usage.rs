@@ -32,6 +32,8 @@ use tower_service::Service;
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_REFRESH_URL: &str = "https://auth.openai.com/oauth/token";
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CODEX_ACCESS_TOKEN_REFRESH_WINDOW_MINUTES: i64 = 5;
+const CODEX_TOKEN_REFRESH_INTERVAL_DAYS: i64 = 8;
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 // The live subscription plan; the usage payload carries none.
 const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
@@ -46,7 +48,7 @@ const CLAUDE_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 // outlives model retirements.
 const CLAUDE_PROBE_MODEL: &str = "claude-haiku-4-5";
 // Keychain generic-password service holding a RAW setup-token (`sk-ant-oat01-…`),
-// the launch-method-independent way to hand TokenBar a token for the limits card:
+// the launch-method-independent way to hand Syrtis a token for the limits card:
 //   security add-generic-password -a "$USER" -s tokenbar-claude-oauth-token -w "<token>"
 const CLAUDE_RAW_TOKEN_KEYCHAIN_SERVICE: &str = "tokenbar-claude-oauth-token";
 
@@ -108,7 +110,7 @@ impl AgentUsagePayload {
                         (
                             snapshot.account_key.clone(),
                             SeriesKey::new(
-                                snapshot.client_id.clone(),
+                                snapshot.client_id.as_str(),
                                 &history_scope,
                                 window_key.clone(),
                             ),
@@ -120,10 +122,59 @@ impl AgentUsagePayload {
     }
 }
 
+/// A quota provider's client id (#324). In a non-test build the only values
+/// are the eight provider variants (`Test` exists under `cfg(test)` only), and
+/// `usable_success` must match each one. `run` hands each fetch its table
+/// entry's id to pass to `apply_provider_outcome`, which stamps it on a
+/// successful snapshot. Serialized as the plain string; the wire is unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderId {
+    Codex,
+    Claude,
+    Antigravity,
+    Copilot,
+    Grok,
+    GrokBot,
+    Kiro,
+    OpenCode,
+    DeepSeek,
+    /// Fixture ids for tests that need a client outside the table.
+    #[cfg(test)]
+    Test(&'static str),
+}
+
+impl ProviderId {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Antigravity => "antigravity",
+            Self::Copilot => "copilot",
+            Self::Grok => "grok",
+            Self::GrokBot => "grok-bot",
+            Self::Kiro => "kiro",
+            Self::OpenCode => "opencode",
+            Self::DeepSeek => "deepseek",
+            #[cfg(test)]
+            Self::Test(id) => id,
+        }
+    }
+}
+
+impl Serialize for ProviderId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentUsageSnapshot {
-    client_id: String,
+    /// Whatever a fetch writes here is replaced by the id the caller passed to
+    /// `apply_provider_outcome` on success; error cards are built with that id,
+    /// and a transient fallback replays a cached snapshot that was stamped when
+    /// it was stored.
+    client_id: ProviderId,
     /// Which account of `client_id` this card is. `None` is the primary, and
     /// is omitted from the wire entirely, so a payload with no extra account
     /// configured is byte-identical to one from before this field existed.
@@ -510,9 +561,9 @@ struct LastGoodEntry {
 /// stored under another's name, which nothing downstream can detect.
 type AccountSlot = (String, Option<String>);
 
-fn account_slot(client_id: &str, account: Option<&str>) -> AccountSlot {
+fn account_slot(client_id: ProviderId, account: Option<&str>) -> AccountSlot {
     (
-        client_id.to_string(),
+        client_id.as_str().to_string(),
         account_key_component(account).map(str::to_string),
     )
 }
@@ -1113,7 +1164,9 @@ enum ClaudeLoginResolution {
     Absent,
     ExplicitLogout,
     Ready(ClaudeCredentials),
-    Terminal,
+    /// Fail closed with this card text. Built only from static literals and a
+    /// `security` exit code, never from credential bytes or error Display.
+    Terminal(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -1344,7 +1397,7 @@ struct ClaudeRefreshResponse {
 }
 
 fn empty_error_snapshot(
-    client_id: &str,
+    client_id: ProviderId,
     account: Option<&str>,
     source: &str,
     now: DateTime<Utc>,
@@ -1356,7 +1409,7 @@ fn empty_error_snapshot(
         // accounts of one client are only distinguishable downstream by this
         // field, so an error attributed to the primary would replace its card.
         account_key: account.map(str::to_string),
-        client_id: client_id.to_string(),
+        client_id,
         source: source.to_string(),
         updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
         identity: None,
@@ -1371,8 +1424,8 @@ fn empty_error_snapshot(
 }
 
 fn usable_success(snapshot: &AgentUsageSnapshot) -> bool {
-    match snapshot.client_id.as_str() {
-        "codex" => {
+    match snapshot.client_id {
+        ProviderId::Codex => {
             !snapshot.windows.is_empty()
                 || snapshot
                     .credits
@@ -1380,27 +1433,32 @@ fn usable_success(snapshot: &AgentUsageSnapshot) -> bool {
                     .and_then(|credits| credits.remaining)
                     .is_some_and(f64::is_finite)
         }
-        "grok" => snapshot
+        ProviderId::Grok => snapshot
             .windows
             .iter()
             .any(|window| window.card_id == "billing.weekly.v1"),
         // Grok Bot is stricter than the rest: a response can carry windows
         // while omitting the weekly meter, and only that meter is the card.
-        "grok-bot" => snapshot
+        ProviderId::GrokBot => snapshot
             .windows
             .iter()
             .any(|window| window.card_id == agent_grokbot::WEEKLY_WINDOW_KEY),
         // "kiro" and "opencode" carry the Kiro and OpenCode Go subscription
         // quotas; like the others their success is a non-empty window set, so a
         // later transient failure keeps the last-good card instead of a bare error.
-        "claude" | "copilot" | "antigravity" | "kiro" | "opencode" => {
+        ProviderId::Claude
+        | ProviderId::Copilot
+        | ProviderId::Antigravity
+        | ProviderId::Kiro
+        | ProviderId::OpenCode => {
             !snapshot.windows.is_empty()
         }
-        "deepseek" => snapshot
+        ProviderId::DeepSeek => snapshot
             .balance
             .as_ref()
             .is_some_and(|balance| balance.total.is_finite()),
-        _ => false,
+        #[cfg(test)]
+        ProviderId::Test(_) => false,
     }
 }
 
@@ -1414,7 +1472,7 @@ fn lock_last_good(
 
 fn apply_provider_outcome_with<F>(
     cache: &Mutex<ProviderLastGoodCache>,
-    client_id: &str,
+    client_id: ProviderId,
     account: Option<&str>,
     failure_source: &str,
     now: DateTime<Utc>,
@@ -1438,6 +1496,10 @@ where
             mut snapshot,
             cache_binding,
         } => {
+            // The id the caller was handed by its table entry wins over
+            // whatever the fetch wrote while building the snapshot, so a card
+            // cannot leave here under another provider's name.
+            snapshot.client_id = client_id;
             match snapshot.account_scope.as_ref() {
                 Ok(_) | Err(AccountScopeError::NoTrustedEvidence) => {}
                 Err(_) => {
@@ -1450,7 +1512,7 @@ where
                         now,
                         format!(
                             "{} account identity could not be verified.",
-                            clean_plan(client_id)
+                            clean_plan(client_id.as_str())
                         ),
                         None,
                     ));
@@ -1533,7 +1595,7 @@ where
 /// `apply_provider_outcome_with` still takes one, because a test needs to
 /// state the instant it is asserting about.
 fn apply_provider_outcome(
-    client_id: &str,
+    client_id: ProviderId,
     account: Option<&str>,
     failure_source: &str,
     outcome: ProviderFetchOutcome,
@@ -1550,58 +1612,114 @@ fn apply_provider_outcome(
     )
 }
 
-pub async fn run(publication_generation: u64) -> AgentUsagePayload {
-    let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-    let (
-        codex,
-        claude,
-        antigravity,
-        copilot,
-        grok,
-        grokbot,
-        kiro,
-        opencode_go,
-        deepseek,
-    ) = tokio::join!(
-        fetch_codex(),
-        fetch_claude_accounts(),
-        fetch_antigravity(),
-        fetch_copilot(),
-        fetch_grok(),
-        fetch_grokbot(),
-        fetch_kiro(),
-        fetch_opencode_go(),
-        fetch_deepseek()
-    );
-    let mut agents = vec![codex];
+/// One provider's fetch, adapted to the shape `run` flattens: every snapshot
+/// the provider wants on screen, in order, and nothing when it has none (a
+/// provider that only appears when signed in returns an empty list rather than
+/// a bare not-signed-in error card).
+///
+/// Not `Send`: the Claude fetch runs its extra accounts on a `LocalSet`. That
+/// costs nothing here, because `tb_agent_usage` drives `run` with
+/// `RUNTIME.block_on` on the calling thread, exactly as it drove the
+/// `tokio::join!` this replaced.
+type ProviderFetch = Pin<Box<dyn Future<Output = Vec<AgentUsageSnapshot>>>>;
+
+pub(crate) struct QuotaProvider {
+    /// The `client_id` this provider's snapshots carry. `run` passes it to
+    /// `fetch`, which is expected to pass it on to `apply_provider_outcome`.
+    /// A card should be published under the id of the provider whose data it
+    /// carries. What checks that: `fetch_table` handing each fetch its own
+    /// entry's id (`each_fetch_is_handed_its_own_entry_id`) and the Success
+    /// branch stamping the caller's id (`the_caller_id_is_stamped_on_a_successful_snapshot`).
+    /// Nothing checks that this line pairs the id with the right provider's
+    /// fetch, that the fetch passes on the id it was handed, or any other place
+    /// where a card's id could change (error cards, the last-good fallback,
+    /// `enrich`).
+    pub(crate) id: ProviderId,
+    /// Receives its own entry's `id` and must pass it to
+    /// `apply_provider_outcome`, which stamps it on every snapshot.
+    fetch: fn(ProviderId) -> ProviderFetch,
+}
+
+fn provider_fetch<F>(future: F) -> ProviderFetch
+where
+    F: Future<Output = Vec<AgentUsageSnapshot>> + 'static,
+{
+    Box::pin(future)
+}
+
+/// Every quota provider, in the order its cards appear. This is the one place a
+/// provider is registered: `run` fetches from it, `tb_quota_provider_ids`
+/// hands its ids to Swift (which derives its transport-log allowlist from
+/// them), and the consistency tests walk it, so a provider added here and
+/// missed elsewhere fails a named test instead of shipping a silent gap (#324).
+pub(crate) const QUOTA_PROVIDERS: &[QuotaProvider] = &[
+    QuotaProvider {
+        id: ProviderId::Codex,
+        fetch: |id| provider_fetch(async move { vec![fetch_codex(id).await] }),
+    },
     // The primary first, then any extra config directories. With none
     // configured this is the single Claude card it has always been.
-    agents.extend(claude);
-    agents.push(antigravity);
-    // Copilot only appears when signed in (via opencode); skip a bare not-signed-in error card.
-    if let Some(copilot) = copilot {
-        agents.push(copilot);
-    }
+    QuotaProvider {
+        id: ProviderId::Claude,
+        fetch: |id| provider_fetch(fetch_claude_accounts(id)),
+    },
+    QuotaProvider {
+        id: ProviderId::Antigravity,
+        fetch: |id| provider_fetch(async move { vec![fetch_antigravity(id).await] }),
+    },
+    // Copilot only appears when signed in (via opencode).
+    QuotaProvider {
+        id: ProviderId::Copilot,
+        fetch: |id| provider_fetch(async move { fetch_copilot(id).await.into_iter().collect() }),
+    },
     // Grok only appears when ~/.grok/auth.json has credentials.
-    if let Some(grok) = grok {
-        agents.push(grok);
-    }
+    QuotaProvider {
+        id: ProviderId::Grok,
+        fetch: |id| provider_fetch(async move { fetch_grok(id).await.into_iter().collect() }),
+    },
     // Grok Bot only appears when a desktop or Cursor login exists.
-    if let Some(grokbot) = grokbot {
-        agents.push(grokbot);
-    }
+    QuotaProvider {
+        id: ProviderId::GrokBot,
+        fetch: |id| provider_fetch(async move { fetch_grokbot(id).await.into_iter().collect() }),
+    },
     // Kiro only appears when signed in (kiro-cli store or Kiro IDE token file).
-    if let Some(kiro) = kiro {
-        agents.push(kiro);
-    }
+    QuotaProvider {
+        id: ProviderId::Kiro,
+        fetch: |id| provider_fetch(async move { fetch_kiro(id).await.into_iter().collect() }),
+    },
     // OpenCode Go only appears when opencode auth.json holds an "opencode-go" api key.
-    if let Some(opencode_go) = opencode_go {
-        agents.push(opencode_go);
-    }
+    QuotaProvider {
+        id: ProviderId::OpenCode,
+        fetch: |id| provider_fetch(async move { fetch_opencode_go(id).await.into_iter().collect() }),
+    },
     // DeepSeek Official is always published. Its card is the capability signal
     // for its Settings row, and a missing credential or a rejected key is
     // reported as an error-only card instead of a fabricated zero.
-    agents.push(deepseek);
+    QuotaProvider {
+        id: ProviderId::DeepSeek,
+        fetch: |id| provider_fetch(async move { vec![fetch_deepseek(id).await] }),
+    },
+];
+
+/// Run every fetch concurrently and concatenate the results in the order the
+/// fetches were given, whatever order they finish in. `join_all` polls all of
+/// them on every wake, as the `tokio::join!` this replaced did.
+async fn fetch_in_order(fetches: Vec<ProviderFetch>) -> Vec<AgentUsageSnapshot> {
+    futures_util::future::join_all(fetches)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Fetch every entry of `providers`, handing each fetch its own entry's id.
+async fn fetch_table(providers: &[QuotaProvider]) -> Vec<AgentUsageSnapshot> {
+    fetch_in_order(providers.iter().map(|p| (p.fetch)(p.id)).collect()).await
+}
+
+pub async fn run(publication_generation: u64) -> AgentUsagePayload {
+    let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let agents = fetch_table(QUOTA_PROVIDERS).await;
     AgentUsagePayload {
         generated_at,
         publication_generation,
@@ -1610,7 +1728,7 @@ pub async fn run(publication_generation: u64) -> AgentUsagePayload {
     }
 }
 
-async fn fetch_grokbot() -> Option<AgentUsageSnapshot> {
+async fn fetch_grokbot(id: ProviderId) -> Option<AgentUsageSnapshot> {
     // After the fetch, not before it: `agent_grokbot::fetch` can sit behind a
     // Keychain authorization prompt for up to 25s, and this instant becomes the
     // snapshot's `updated_at`. The adapter takes its own instant for the reset
@@ -1618,7 +1736,7 @@ async fn fetch_grokbot() -> Option<AgentUsageSnapshot> {
     let result = agent_grokbot::fetch().await;
     let outcome = grokbot_outcome(result, Utc::now());
     let failure_source = grokbot_failure_source(&outcome);
-    apply_provider_outcome("grok-bot", None, failure_source, outcome)
+    apply_provider_outcome(id, None, failure_source, outcome)
 }
 
 /// Which `source` a failed Grok Bot fetch publishes under. Everything is
@@ -1656,7 +1774,7 @@ fn grokbot_outcome(
             cache_binding: data.cache_binding,
             snapshot: AgentUsageSnapshot {
                 account_key: None,
-                client_id: "grok-bot".to_string(),
+                client_id: ProviderId::GrokBot, // replaced by apply_provider_outcome
                 source: "oauth".to_string(),
                 updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
                 identity: data.identity,
@@ -1674,19 +1792,19 @@ fn grokbot_outcome(
     }
 }
 
-async fn fetch_grok() -> Option<AgentUsageSnapshot> {
+async fn fetch_grok(id: ProviderId) -> Option<AgentUsageSnapshot> {
     let now = Utc::now();
     let outcome = match agent_grok::fetch(now).await {
         Ok(Some(data)) => ProviderFetchOutcome::Success {
             cache_binding: data.cache_binding,
             snapshot: AgentUsageSnapshot {
                 account_key: None,
-                client_id: "grok".to_string(),
+                client_id: id,
                 source: "oauth".to_string(),
                 updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
                 identity: data.identity,
                 account_scope: data.account_scope,
-                // Grok has no authoritative owner ID in anything TokenBar fetches.
+                // Grok has no authoritative owner ID in anything Syrtis fetches.
                 history_scope: agent_account_scope::resolve_history_scope("grok", None),
                 windows: data.windows,
                 credits: None,
@@ -1698,10 +1816,10 @@ async fn fetch_grok() -> Option<AgentUsageSnapshot> {
         Ok(None) => ProviderFetchOutcome::Absent,
         Err(failure) => ProviderFetchOutcome::Failure(failure),
     };
-    apply_provider_outcome("grok", None, "oauth", outcome)
+    apply_provider_outcome(id, None, "oauth", outcome)
 }
 
-async fn fetch_kiro() -> Option<AgentUsageSnapshot> {
+async fn fetch_kiro(id: ProviderId) -> Option<AgentUsageSnapshot> {
     let now = Utc::now();
     let outcome = match crate::kiro_integrations::kiro_credential(now).await {
         crate::kiro_integrations::KiroCredentialLoad::Absent => ProviderFetchOutcome::Absent,
@@ -1714,12 +1832,12 @@ async fn fetch_kiro() -> Option<AgentUsageSnapshot> {
                     cache_binding: Some(data.cache_binding),
                     snapshot: AgentUsageSnapshot {
                         account_key: None,
-                        client_id: "kiro".to_string(),
+                        client_id: id,
                         source: "oauth".to_string(),
                         updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
                         identity: data.identity,
                         account_scope: data.account_scope,
-                        // Kiro has no authoritative owner ID in what TokenBar fetches.
+                        // Kiro has no authoritative owner ID in what Syrtis fetches.
                         history_scope: agent_account_scope::resolve_history_scope("kiro", None),
                         windows: data.windows,
                         credits: None,
@@ -1732,13 +1850,13 @@ async fn fetch_kiro() -> Option<AgentUsageSnapshot> {
             }
         }
     };
-    apply_provider_outcome("kiro", None, "oauth", outcome)
+    apply_provider_outcome(id, None, "oauth", outcome)
 }
 
 /// DeepSeek Official: a prepaid API balance, not a percent quota. It carries
 /// no windows on purpose — the amount is not a percentage and must not enter
 /// pace, history, or the quota curve.
-async fn fetch_deepseek() -> AgentUsageSnapshot {
+async fn fetch_deepseek(id: ProviderId) -> AgentUsageSnapshot {
     let result = agent_deepseek::fetch().await;
     let now = Utc::now();
     let outcome = match result {
@@ -1746,7 +1864,7 @@ async fn fetch_deepseek() -> AgentUsageSnapshot {
             cache_binding: Some(data.cache_binding),
             snapshot: AgentUsageSnapshot {
                 account_key: None,
-                client_id: "deepseek".to_string(),
+                client_id: id,
                 source: "api-key".to_string(),
                 updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
                 identity: data.identity,
@@ -1761,11 +1879,11 @@ async fn fetch_deepseek() -> AgentUsageSnapshot {
         },
         Err(failure) => ProviderFetchOutcome::Failure(failure),
     };
-    apply_provider_outcome("deepseek", None, "api-key", outcome)
+    apply_provider_outcome(id, None, "api-key", outcome)
         .expect("DeepSeek is a required provider card")
 }
 
-async fn fetch_copilot() -> Option<AgentUsageSnapshot> {
+async fn fetch_copilot(id: ProviderId) -> Option<AgentUsageSnapshot> {
     let now = Utc::now();
     let outcome = match crate::opencode_integrations::github_copilot_credential() {
         crate::opencode_integrations::GitHubCopilotCredentialLoad::Absent => {
@@ -1780,7 +1898,7 @@ async fn fetch_copilot() -> Option<AgentUsageSnapshot> {
                     cache_binding: Some(data.cache_binding),
                     snapshot: AgentUsageSnapshot {
                         account_key: None,
-                        client_id: "copilot".to_string(),
+                        client_id: id,
                         source: "oauth".to_string(),
                         updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
                         identity: data.identity,
@@ -1798,10 +1916,10 @@ async fn fetch_copilot() -> Option<AgentUsageSnapshot> {
             }
         }
     };
-    apply_provider_outcome("copilot", None, "oauth", outcome)
+    apply_provider_outcome(id, None, "oauth", outcome)
 }
 
-async fn fetch_opencode_go() -> Option<AgentUsageSnapshot> {
+async fn fetch_opencode_go(id: ProviderId) -> Option<AgentUsageSnapshot> {
     let now = Utc::now();
     let outcome = match crate::opencode_integrations::opencode_go_credential() {
         crate::opencode_integrations::OpenCodeGoCredentialLoad::Absent => {
@@ -1820,12 +1938,12 @@ async fn fetch_opencode_go() -> Option<AgentUsageSnapshot> {
                         // `opencode` client tab, mirroring how the Copilot quota
                         // (also fetched via opencode auth) feeds the `copilot`
                         // tab rather than a separate one.
-                        client_id: "opencode".to_string(),
+                        client_id: id,
                         source: "api".to_string(),
                         updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
                         identity: data.identity,
                         account_scope: data.account_scope,
-                        // OpenCode Go has no authoritative owner ID in what TokenBar fetches.
+                        // OpenCode Go has no authoritative owner ID in what Syrtis fetches.
                         history_scope: agent_account_scope::resolve_history_scope("opencode", None),
                         windows: data.windows,
                         credits: None,
@@ -1838,17 +1956,17 @@ async fn fetch_opencode_go() -> Option<AgentUsageSnapshot> {
             }
         }
     };
-    apply_provider_outcome("opencode", None, "api", outcome)
+    apply_provider_outcome(id, None, "api", outcome)
 }
 
-async fn fetch_antigravity() -> AgentUsageSnapshot {
+async fn fetch_antigravity(id: ProviderId) -> AgentUsageSnapshot {
     let now = Utc::now();
     let outcome = match agent_antigravity::fetch(now).await {
         Ok(fetched) => ProviderFetchOutcome::Success {
             cache_binding: fetched.cache_binding,
             snapshot: AgentUsageSnapshot {
                 account_key: None,
-                client_id: "antigravity".to_string(),
+                client_id: id,
                 source: fetched.source,
                 updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
                 identity: fetched.identity,
@@ -1863,13 +1981,45 @@ async fn fetch_antigravity() -> AgentUsageSnapshot {
         },
         Err(failure) => ProviderFetchOutcome::Failure(failure),
     };
-    apply_provider_outcome("antigravity", None, "oauth", outcome)
+    let source = required_card_source(&outcome, agent_antigravity::ANTIGRAVITY_UNCONFIGURED_ERROR);
+    apply_provider_outcome(id, None, source, outcome)
         .expect("Antigravity is a required provider card")
 }
 
-async fn fetch_codex() -> AgentUsageSnapshot {
-    apply_provider_outcome("codex", None, "oauth", fetch_codex_inner().await)
+async fn fetch_codex(id: ProviderId) -> AgentUsageSnapshot {
+    let outcome = fetch_codex_inner().await;
+    let source = required_card_source(&outcome, CODEX_UNCONFIGURED_ERROR);
+    apply_provider_outcome(id, None, source, outcome)
         .expect("Codex is a required provider card")
+}
+
+/// The `source` a required provider card reports for a failed fetch.
+///
+/// Codex, Claude and Antigravity always contribute a card whether or not the
+/// user has them — only the optional providers' adapters in `QUOTA_PROVIDERS`
+/// return nothing when no login exists. So for these three, "a card is present" says nothing about whether
+/// anything is configured, and the payload has to carry the difference: the Swift
+/// side reads `isSetupPlaceholder`, and through it `configuredClientIds`, to
+/// decide which quota sources earn a tab. Reporting `oauth` for a card that has
+/// never had a credential gave every install an Antigravity tab and a Codex tab
+/// from v1.18.0, when tab navigation started including quota-only providers
+/// (#345).
+///
+/// Claude reaches the same verdict structurally, through `ClaudeLoginResolution`.
+/// Codex and Antigravity each conclude "nothing is configured" at exactly one
+/// place, so each pairs its own message with this decision rather than growing a
+/// variant on the shared failure type that every other provider would carry.
+/// A transient failure is never `unconfigured`: it means the credential could not
+/// be reached, not that it is absent.
+fn required_card_source(outcome: &ProviderFetchOutcome, unconfigured: &str) -> &'static str {
+    match outcome {
+        ProviderFetchOutcome::Failure(ProviderFetchFailure::Terminal { display })
+            if display == unconfigured =>
+        {
+            "unconfigured"
+        }
+        _ => "oauth",
+    }
 }
 
 /// Claude's `/api/oauth/usage` rate-limits aggressively. The gate stores only
@@ -1971,9 +2121,9 @@ fn parse_retry_after(value: Option<&reqwest::header::HeaderValue>) -> Option<Dat
         .map(|t| t.with_timezone(&Utc))
 }
 
-async fn fetch_claude() -> AgentUsageSnapshot {
+async fn fetch_claude(id: ProviderId) -> AgentUsageSnapshot {
     let (failure_source, outcome) = fetch_claude_inner().await;
-    apply_provider_outcome("claude", None, failure_source, outcome)
+    apply_provider_outcome(id, None, failure_source, outcome)
         .expect("Claude is a required provider card")
 }
 
@@ -1982,15 +2132,15 @@ async fn fetch_claude() -> AgentUsageSnapshot {
 ///
 /// With no extra directory configured the registry is empty, the loop body
 /// never runs, and this is the single `fetch_claude()` call it was before.
-async fn fetch_claude_accounts() -> Vec<AgentUsageSnapshot> {
+async fn fetch_claude_accounts(id: ProviderId) -> Vec<AgentUsageSnapshot> {
     let config_dirs = crate::claude_config_dirs::snapshot();
     if config_dirs.is_empty() {
-        return vec![fetch_claude().await];
+        return vec![fetch_claude(id).await];
     }
     // Concurrent, not sequential. An earlier version ran these in a loop and
     // justified it as "one extra account costs one more round trip on a 60s
     // poll", which measures the wrong thing: each request owns a 30-second
-    // timeout, and the provider-wide `tokio::join!` above cannot return until
+    // timeout, and the provider-wide join in `run` cannot return until
     // this function does, so a slow Claude account holds back the already
     // finished Codex, Copilot, Grok and Antigravity cards for as long as it
     // takes — and Settings sets no limit on how many accounts there are, so
@@ -2001,10 +2151,10 @@ async fn fetch_claude_accounts() -> Vec<AgentUsageSnapshot> {
     // a rate-limit. Four is above any realistic account count, so the bound
     // costs nothing in practice and exists for the case that is not realistic.
     let mut work: Vec<Pin<Box<dyn Future<Output = AgentUsageSnapshot>>>> =
-        vec![Box::pin(fetch_claude())];
+        vec![Box::pin(fetch_claude(id))];
     for config_dir in config_dirs {
         work.push(Box::pin(async move {
-            fetch_claude_extra_account(&config_dir).await
+            fetch_claude_extra_account(id, &config_dir).await
         }));
     }
     join_local_ordered(work).await
@@ -2056,9 +2206,9 @@ async fn join_local_ordered<T: 'static>(
         .await
 }
 
-async fn fetch_claude_extra_account(config_dir: &str) -> AgentUsageSnapshot {
+async fn fetch_claude_extra_account(id: ProviderId, config_dir: &str) -> AgentUsageSnapshot {
     let (failure_source, outcome) = fetch_claude_extra_inner(config_dir).await;
-    apply_provider_outcome("claude", Some(config_dir), failure_source, outcome)
+    apply_provider_outcome(id, Some(config_dir), failure_source, outcome)
         .expect("an extra Claude account always produces a card")
 }
 
@@ -2103,9 +2253,7 @@ fn load_claude_config_dir_credentials_with<L>(
 where
     L: FnOnce(Option<&str>) -> Result<Option<String>, String>,
 {
-    let raw = load(Some(config_dir))
-        .map_err(|_| CLAUDE_CREDENTIALS_LOAD_ERROR.to_string())?
-        .ok_or_else(|| CLAUDE_EXTRA_UNCONFIGURED_ERROR.to_string())?;
+    let raw = load(Some(config_dir))?.ok_or_else(|| CLAUDE_EXTRA_UNCONFIGURED_ERROR.to_string())?;
     match resolve_stored_claude_login(&raw, ClaudeCredentialSource::Keychain) {
         ClaudeLoginResolution::Ready(mut credentials) => {
             // `claude_login_scope_slot` names the primary directory's fixed
@@ -2122,7 +2270,7 @@ where
         ClaudeLoginResolution::Absent | ClaudeLoginResolution::ExplicitLogout => {
             Err(CLAUDE_EXTRA_UNCONFIGURED_ERROR.to_string())
         }
-        ClaudeLoginResolution::Terminal => Err(CLAUDE_CREDENTIALS_LOAD_ERROR.to_string()),
+        ClaudeLoginResolution::Terminal(display) => Err(display),
     }
 }
 
@@ -2133,7 +2281,7 @@ async fn fetch_codex_inner() -> ProviderFetchOutcome {
             return ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(display));
         }
     };
-    let verified = if credentials_needs_refresh(loaded.last_refresh) {
+    let verified = if codex_credentials_needs_refresh(&loaded.access_token, loaded.last_refresh) {
         refresh_codex_credentials(&loaded.auth_path).await
     } else {
         resolve_codex_cache_binding(&loaded)
@@ -2266,7 +2414,7 @@ async fn fetch_codex_inner() -> ProviderFetchOutcome {
     ProviderFetchOutcome::Success {
         snapshot: AgentUsageSnapshot {
             account_key: None,
-            client_id: "codex".to_string(),
+            client_id: ProviderId::Codex, // replaced by apply_provider_outcome
             source: "oauth".to_string(),
             updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
             identity,
@@ -2592,11 +2740,9 @@ where
 {
     match login {
         ClaudeLoginResolution::Ready(credentials) => request_login(credentials).await,
-        ClaudeLoginResolution::Terminal => (
+        ClaudeLoginResolution::Terminal(display) => (
             "oauth",
-            ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(
-                CLAUDE_CREDENTIALS_LOAD_ERROR,
-            )),
+            ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(display)),
         ),
         ClaudeLoginResolution::Absent | ClaudeLoginResolution::ExplicitLogout => {
             match load_setup() {
@@ -2607,11 +2753,9 @@ where
                         CLAUDE_UNCONFIGURED_ERROR,
                     )),
                 ),
-                Err(_) => (
+                Err(display) => (
                     "setup-token",
-                    ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(
-                        CLAUDE_CREDENTIALS_LOAD_ERROR,
-                    )),
+                    ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(display)),
                 ),
             }
         }
@@ -2896,7 +3040,7 @@ async fn fetch_claude_oauth_usage_request(
         ProviderFetchOutcome::Success {
             snapshot: AgentUsageSnapshot {
                 account_key: identity.account_key.clone(),
-                client_id: "claude".to_string(),
+                client_id: ProviderId::Claude, // replaced by apply_provider_outcome
                 source: "oauth".to_string(),
                 updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
                 identity: Some(AgentIdentity {
@@ -3182,7 +3326,7 @@ async fn claude_header_snapshot(
     ProviderFetchOutcome::Success {
         snapshot: AgentUsageSnapshot {
             account_key: identity.account_key.clone(),
-            client_id: "claude".to_string(),
+            client_id: ProviderId::Claude, // replaced by apply_provider_outcome
             source: "setup-token".to_string(),
             updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
             identity: Some(AgentIdentity {
@@ -3210,8 +3354,19 @@ fn load_codex_credentials() -> Result<CodexCredentials, String> {
 }
 
 fn load_codex_credentials_from(auth_path: &Path) -> Result<CodexCredentials, String> {
-    let raw = fs::read_to_string(auth_path)
-        .map_err(|_| "Codex auth.json not found. Run `codex` to log in.".to_string())?;
+    // Only an absent file means "not set up". `read_to_string` also fails for a
+    // permission problem, a directory at this path, or invalid UTF-8, and every
+    // one of those belongs to a configured account whose credential is broken:
+    // mapping them to the marker would hand them `source: "unconfigured"`, which
+    // takes the card out of tab navigation and tells the user to log in again
+    // (#345).
+    let raw = fs::read_to_string(auth_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            CODEX_UNCONFIGURED_ERROR.to_string()
+        } else {
+            CODEX_CREDENTIALS_UNREADABLE_ERROR.to_string()
+        }
+    })?;
     let raw_json: Value =
         serde_json::from_str(&raw).map_err(|e| format!("decode Codex auth.json: {}", e))?;
 
@@ -3263,32 +3418,68 @@ fn load_codex_credentials_from(auth_path: &Path) -> Result<CodexCredentials, Str
 /// with `source == "unconfigured"`, so the UI shows a setup prompt rather than a
 /// red error.
 const CLAUDE_UNCONFIGURED_ERROR: &str = "Claude OAuth credentials not found. Run `claude` to authenticate, or set CLAUDE_CODE_OAUTH_TOKEN / add a `tokenbar-claude-oauth-token` Keychain item to use a setup-token.";
+/// The Codex sibling of `CLAUDE_UNCONFIGURED_ERROR`: there is no `auth.json` to
+/// read at all. Paired with `source == "unconfigured"` by
+/// `required_card_source`; see that function for why the distinction has to
+/// reach the payload rather than staying a message.
+const CODEX_UNCONFIGURED_ERROR: &str = "Codex auth.json not found. Run `codex` to log in.";
+/// `auth.json` exists but could not be read. Deliberately not the marker above:
+/// `required_card_source` leaves this at `oauth`, so the card keeps its tab and
+/// shows the failure instead of claiming the user never logged in.
+const CODEX_CREDENTIALS_UNREADABLE_ERROR: &str = "Codex auth.json could not be read.";
 const CLAUDE_CREDENTIALS_LOAD_ERROR: &str = "Claude credentials could not be loaded.";
+const CLAUDE_CREDENTIALS_LOAD_PREFIX: &str = "Claude credentials could not be loaded: ";
+// Terminal reasons (#225). Each keeps the sentence above as its prefix so
+// existing reports still match; none may carry credential bytes.
+const CLAUDE_KEYCHAIN_SPAWN_ERROR: &str =
+    "Claude credentials could not be loaded: the Keychain could not be queried.";
+/// `security` killed by a signal: `ExitStatus::code()` has no number to show.
+const CLAUDE_KEYCHAIN_SIGNAL_ERROR: &str =
+    "Claude credentials could not be loaded: Keychain read failed (security was stopped by a signal).";
+const CLAUDE_KEYCHAIN_NOT_TEXT_ERROR: &str =
+    "Claude credentials could not be loaded: the Keychain item is not text.";
+const CLAUDE_KEYCHAIN_EMPTY_ERROR: &str =
+    "Claude credentials could not be loaded: the Keychain item is empty.";
+const CLAUDE_CREDENTIALS_FILE_UNREADABLE_ERROR: &str =
+    "Claude credentials could not be loaded: ~/.claude/.credentials.json could not be read.";
+const CLAUDE_STORED_LOGIN_MALFORMED_ERROR: &str =
+    "Claude credentials could not be loaded: the stored login is malformed.";
+const CLAUDE_STORED_LOGIN_NO_ACCESS_TOKEN_ERROR: &str =
+    "Claude credentials could not be loaded: the stored login has no access token.";
+const CLAUDE_SETUP_KEYCHAIN_SPAWN_ERROR: &str =
+    "The Syrtis setup-token Keychain item could not be read: the Keychain could not be queried.";
+const CLAUDE_SETUP_KEYCHAIN_SIGNAL_ERROR: &str =
+    "The Syrtis setup-token Keychain item could not be read (security was stopped by a signal).";
+const CLAUDE_SETUP_KEYCHAIN_NOT_TEXT_ERROR: &str =
+    "The Syrtis setup-token Keychain item is not text.";
+const CLAUDE_SETUP_KEYCHAIN_EMPTY_ERROR: &str = "The Syrtis setup-token Keychain item is empty.";
 /// An extra config directory is configured but its Keychain item holds no
 /// usable login. Distinct from the primary's unconfigured message: there is no
 /// setup-token fallback for an isolated account, and naming one would send the
 /// user to a credential that belongs to the other account.
 const CLAUDE_EXTRA_UNCONFIGURED_ERROR: &str = "No Claude login found for this config directory. Run `claude` with CLAUDE_CONFIG_DIR set to it.";
-/// TokenBar refreshes only the primary directory's credential in place, so an
+/// Syrtis refreshes only the primary directory's credential in place, so an
 /// isolated account's expired token has to be rotated by Claude Code itself.
 const CLAUDE_EXTRA_EXPIRED_ERROR: &str = "Claude credentials for this config directory have expired. Run `claude` with CLAUDE_CONFIG_DIR set to it.";
 
 /// Full-login credentials: structured `claudeAiOauth` blobs (Keychain
 /// `Claude Code-credentials`, then `~/.claude/.credentials.json`) plus the
-/// TokenBar env override. Only a genuinely missing higher-priority store falls
+/// Syrtis env override. Only a genuinely missing higher-priority store falls
 /// through; the explicit #26 logout shape stops full-login precedence.
 fn load_claude_login_credentials() -> ClaudeLoginResolution {
     match load_claude_credentials_from_environment() {
         Ok(Some(credentials)) => return ClaudeLoginResolution::Ready(credentials),
         Ok(None) => {}
-        Err(_) => return ClaudeLoginResolution::Terminal,
+        Err(_) => {
+            return ClaudeLoginResolution::Terminal(CLAUDE_CREDENTIALS_LOAD_ERROR.to_string())
+        }
     }
     load_stored_claude_login_with(
         load_claude_credentials_from_keychain,
         || match fs::read_to_string(claude_credentials_path()) {
             Ok(raw) => Ok(Some(raw)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(_) => Err("Claude credentials file could not be read.".to_string()),
+            Err(_) => Err(CLAUDE_CREDENTIALS_FILE_UNREADABLE_ERROR.to_string()),
         },
     )
 }
@@ -3306,19 +3497,21 @@ where
             return resolve_stored_claude_login(&raw, ClaudeCredentialSource::Keychain);
         }
         Ok(None) => {}
-        Err(_) => return ClaudeLoginResolution::Terminal,
+        Err(display) => return ClaudeLoginResolution::Terminal(display),
     }
     match load_file() {
         Ok(Some(raw)) => resolve_stored_claude_login(&raw, ClaudeCredentialSource::File),
         Ok(None) => ClaudeLoginResolution::Absent,
-        Err(_) => ClaudeLoginResolution::Terminal,
+        Err(display) => ClaudeLoginResolution::Terminal(display),
     }
 }
 
 fn resolve_stored_claude_login(raw: &str, source: ClaudeCredentialSource) -> ClaudeLoginResolution {
     let raw_root: Value = match serde_json::from_str(raw) {
         Ok(root) => root,
-        Err(_) => return ClaudeLoginResolution::Terminal,
+        Err(_) => {
+            return ClaudeLoginResolution::Terminal(CLAUDE_STORED_LOGIN_MALFORMED_ERROR.to_string())
+        }
     };
     // A store with no `claudeAiOauth` at all carries no Claude login (e.g. an
     // mcpOAuth-only Keychain item, issue #219). That is absence, not a malformed
@@ -3337,7 +3530,7 @@ fn resolve_stored_claude_login(raw: &str, source: ClaudeCredentialSource) -> Cla
     }
     match parse_claude_credentials_data(raw, source) {
         Ok(credentials) => ClaudeLoginResolution::Ready(credentials),
-        Err(_) => ClaudeLoginResolution::Terminal,
+        Err(display) => ClaudeLoginResolution::Terminal(display),
     }
 }
 
@@ -3367,7 +3560,7 @@ async fn resolve_claude_code_oauth_token() -> Option<ResolvedClaudeToken> {
         })
 }
 
-/// The `tokenbar-claude-oauth-token` Keychain item (a TokenBar-specific setup
+/// The `tokenbar-claude-oauth-token` Keychain item (a Syrtis-specific setup
 /// token). A last-resort fallback, below the stored `/login`.
 fn resolve_claude_keychain_token() -> Result<Option<ResolvedClaudeToken>, String> {
     load_claude_raw_token_from_keychain().map(|token| {
@@ -3428,10 +3621,12 @@ fn parse_claude_credentials_data(
     raw: &str,
     source: ClaudeCredentialSource,
 ) -> Result<ClaudeCredentials, String> {
+    // Never the serde error's Display: invalid-type errors quote the offending
+    // value, which here is credential content, and this string reaches the card.
     let raw_root: Value =
-        serde_json::from_str(raw).map_err(|e| format!("decode Claude OAuth credentials: {}", e))?;
+        serde_json::from_str(raw).map_err(|_| CLAUDE_STORED_LOGIN_MALFORMED_ERROR.to_string())?;
     let root: ClaudeCredentialsRoot =
-        serde_json::from_str(raw).map_err(|e| format!("decode Claude OAuth credentials: {}", e))?;
+        serde_json::from_str(raw).map_err(|_| CLAUDE_STORED_LOGIN_MALFORMED_ERROR.to_string())?;
     let oauth = root
         .claude_ai_oauth
         .ok_or_else(|| "Claude OAuth credentials are missing claudeAiOauth.".to_string())?;
@@ -3439,7 +3634,7 @@ fn parse_claude_credentials_data(
         .access_token
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty())
-        .ok_or_else(|| "Claude OAuth credentials have no access token.".to_string())?;
+        .ok_or_else(|| CLAUDE_STORED_LOGIN_NO_ACCESS_TOKEN_ERROR.to_string())?;
     let expires_at = oauth
         .expires_at
         .and_then(|millis| Utc.timestamp_millis_opt(millis as i64).single());
@@ -3472,7 +3667,10 @@ fn claude_login_scope_slot(source: ClaudeCredentialSource) -> Result<CredentialS
                 &claude_credentials_path(),
                 Some("claudeAiOauth"),
             )
-            .map_err(|_| "Claude credential location cannot be scoped safely.".to_string())?,
+            .map_err(|_| {
+                "Claude credentials could not be loaded: the credential location cannot be scoped safely."
+                    .to_string()
+            })?,
         }),
         ClaudeCredentialSource::Environment => {
             Err("environment credentials require an explicit account-scope slot".to_string())
@@ -3480,9 +3678,73 @@ fn claude_login_scope_slot(source: ClaudeCredentialSource) -> Result<CredentialS
     }
 }
 
-#[cfg(target_os = "macos")]
-fn keychain_item_not_found(status: &std::process::ExitStatus) -> bool {
-    status.code() == Some(44)
+/// `security find-generic-password -w` prints the whole value as lowercase hex
+/// (issue #226, e.g. an item holding "café") when any byte is outside printable
+/// ASCII 0x20..=0x7E. Accept only a rendering that rule could have produced:
+/// even length, all [0-9a-f], decoding to UTF-8 with a non-printable byte.
+/// Anything else is text already and is left alone (None).
+fn decode_security_hex_output(text: &str) -> Option<String> {
+    if !text.len().is_multiple_of(2)
+        || !text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    let bytes = (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    if bytes.iter().all(|b| (0x20..=0x7E).contains(b)) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Post-spawn half of `load_claude_credentials_from_keychain_item`. `exit` is
+/// `ExitStatus::code()` (None = killed by a signal); 44 is item-not-found.
+fn claude_keychain_item_output(
+    exit: Option<i32>,
+    stdout: Vec<u8>,
+) -> Result<Option<String>, String> {
+    match exit {
+        Some(0) => {}
+        Some(44) => return Ok(None),
+        Some(code) => {
+            let reason = format!("Keychain read failed (security exit {code}).");
+            return Err(format!("{CLAUDE_CREDENTIALS_LOAD_PREFIX}{reason}"));
+        }
+        None => return Err(CLAUDE_KEYCHAIN_SIGNAL_ERROR.to_string()),
+    }
+    let raw = String::from_utf8(stdout).map_err(|_| CLAUDE_KEYCHAIN_NOT_TEXT_ERROR.to_string())?;
+    let raw = raw.trim_matches(['\r', '\n']);
+    let raw = decode_security_hex_output(raw).unwrap_or_else(|| raw.to_string());
+    if raw.trim().is_empty() {
+        return Err(CLAUDE_KEYCHAIN_EMPTY_ERROR.to_string());
+    }
+    Ok(Some(raw))
+}
+
+/// Post-spawn half of `load_claude_raw_token_from_keychain`.
+fn claude_raw_token_output(exit: Option<i32>, stdout: Vec<u8>) -> Result<Option<String>, String> {
+    match exit {
+        Some(0) => {}
+        Some(44) => return Ok(None),
+        Some(code) => {
+            return Err(format!(
+                "The Syrtis setup-token Keychain item could not be read (security exit {code})."
+            ))
+        }
+        None => return Err(CLAUDE_SETUP_KEYCHAIN_SIGNAL_ERROR.to_string()),
+    }
+    let raw =
+        String::from_utf8(stdout).map_err(|_| CLAUDE_SETUP_KEYCHAIN_NOT_TEXT_ERROR.to_string())?;
+    let raw = raw.trim();
+    // A hex rendering hides the stored whitespace from the first trim.
+    let raw = decode_security_hex_output(raw)
+        .map_or_else(|| raw.to_string(), |decoded| decoded.trim().to_string());
+    if raw.is_empty() {
+        return Err(CLAUDE_SETUP_KEYCHAIN_EMPTY_ERROR.to_string());
+    }
+    Ok(Some(raw))
 }
 
 /// Keychain service holding the credentials for one `CLAUDE_CONFIG_DIR`.
@@ -3530,21 +3792,8 @@ fn load_claude_credentials_from_keychain_item(
     let output = command
         .arg("-w")
         .output()
-        .map_err(|e| format!("read Claude Keychain credentials: {}", e))?;
-    if !output.status.success() {
-        return if keychain_item_not_found(&output.status) {
-            Ok(None)
-        } else {
-            Err("Claude Keychain credentials could not be read.".to_string())
-        };
-    }
-    let raw = String::from_utf8(output.stdout)
-        .map_err(|_| "Claude Keychain credentials are not UTF-8 JSON.".to_string())?;
-    let raw = raw.trim_matches(['\r', '\n']).to_string();
-    if raw.trim().is_empty() {
-        return Err("Claude Keychain credentials are empty.".to_string());
-    }
-    Ok(Some(raw))
+        .map_err(|_| CLAUDE_KEYCHAIN_SPAWN_ERROR.to_string())?;
+    claude_keychain_item_output(output.status.code(), output.stdout)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -3726,21 +3975,8 @@ fn load_claude_raw_token_from_keychain() -> Result<Option<String>, String> {
             "-w",
         ])
         .output()
-        .map_err(|e| format!("read TokenBar Claude token from Keychain: {}", e))?;
-    if !output.status.success() {
-        return if keychain_item_not_found(&output.status) {
-            Ok(None)
-        } else {
-            Err("TokenBar Claude Keychain token could not be read.".to_string())
-        };
-    }
-    let raw = String::from_utf8(output.stdout)
-        .map_err(|_| "TokenBar Claude Keychain token is not UTF-8.".to_string())?;
-    let raw = raw.trim().to_string();
-    if raw.is_empty() {
-        return Err("TokenBar Claude Keychain token is empty.".to_string());
-    }
-    Ok(Some(raw))
+        .map_err(|_| CLAUDE_SETUP_KEYCHAIN_SPAWN_ERROR.to_string())?;
+    claude_raw_token_output(output.status.code(), output.stdout)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -3860,7 +4096,7 @@ where
     let pre_binding = resolve_codex_cache_binding_with(&credentials, refresh).map_err(|_| {
         ProviderFetchFailure::terminal("Codex account identity could not be verified.")
     })?;
-    if !credentials_needs_refresh(credentials.last_refresh) {
+    if !codex_credentials_needs_refresh(&credentials.access_token, credentials.last_refresh) {
         return Ok((credentials, pre_binding));
     }
 
@@ -4241,7 +4477,7 @@ where
 
 /// Replace `path` atomically: write a sibling temp file, then rename over the
 /// target. A crash or partial write leaves the original credentials intact
-/// rather than a truncated file that would break both TokenBar and the Claude
+/// rather than a truncated file that would break both Syrtis and the Claude
 /// CLI (the rename is atomic within one filesystem).
 fn atomic_write(path: &Path, data: &str) -> Result<(), String> {
     let parent = path.parent().ok_or_else(|| {
@@ -4613,7 +4849,7 @@ fn save_codex_credentials(
 }
 
 /// Restore the pre-refresh Codex root only while this refresh still owns the
-/// exact root it persisted. External Codex writers do not share TokenBar's
+/// exact root it persisted. External Codex writers do not share Syrtis's
 /// refresh lock, so the compare-to-rename interval remains a known residual
 /// window rather than a filesystem compare-and-swap.
 fn rollback_codex_credentials_if_unchanged(
@@ -4637,6 +4873,17 @@ fn enrich_snapshot(snapshot: &mut AgentUsageSnapshot, now: i64) {
     enrich_snapshot_with(snapshot, now, |active_keys, observations, now| {
         crate::agent_quota_history::record_observations_and_evaluate(active_keys, observations, now)
     });
+}
+
+/// The pace reason for a verified account whose history scope did not resolve.
+/// See the guard in `enrich_snapshot_with`.
+fn history_scope_unavailable_reason(error: &AccountScopeError) -> &'static str {
+    match error {
+        AccountScopeError::NoTrustedEvidence | AccountScopeError::InvalidEvidence => {
+            "accountScope"
+        }
+        _ => "history",
+    }
 }
 
 fn enrich_snapshot_with<F>(snapshot: &mut AgentUsageSnapshot, now: i64, mut record: F)
@@ -4678,13 +4925,27 @@ where
         }
         return;
     };
-    let Ok(history_scope) = snapshot.history_scope.as_ref() else {
-        for window in &mut snapshot.windows {
-            if window.window_key.is_some() {
-                window.unavailable("accountScope");
+    // A verified account can still have no history identity, for two reasons
+    // that Swift must tell apart. `NoTrustedEvidence` / `InvalidEvidence` are
+    // set on purpose and are permanent (a Grok Bot token with no subject; the
+    // extra-Claude-account refusal in the account identity code is defensive
+    // and not reached today): nothing is ever recorded, so it stays
+    // `accountScope`, which Swift reads
+    // as "nothing recorded" (`PaceStatus.historyKey`). Anything else is a
+    // storage failure resolving the installation key; the series may already
+    // hold cycles, so it is `history`, as a failed record is, and Swift keeps
+    // reading it and treats the throw as a failure.
+    let history_scope = match snapshot.history_scope.as_ref() {
+        Ok(history_scope) => history_scope,
+        Err(error) => {
+            let reason = history_scope_unavailable_reason(error);
+            for window in &mut snapshot.windows {
+                if window.window_key.is_some() {
+                    window.unavailable(reason);
+                }
             }
+            return;
         }
-        return;
     };
     let mut active_keys = Vec::new();
     let mut observations = Vec::new();
@@ -4695,7 +4956,7 @@ where
             // The provider already classified this card as windowIdentity.
             continue;
         };
-        let key = SeriesKey::new(snapshot.client_id.clone(), history_scope, window_key);
+        let key = SeriesKey::new(snapshot.client_id.as_str(), history_scope, window_key);
         active_keys.push(key.clone());
         if matches!(window.pace_status.state, PaceState::Unavailable) {
             // Emission protects existing history from capacity eviction, but
@@ -5511,11 +5772,32 @@ fn claude_credentials_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".claude/.credentials.json"))
 }
 
-fn credentials_needs_refresh(last_refresh: Option<DateTime<Utc>>) -> bool {
+fn codex_credentials_needs_refresh(
+    access_token: &str,
+    last_refresh: Option<DateTime<Utc>>,
+) -> bool {
+    codex_credentials_needs_refresh_at(access_token, last_refresh, Utc::now())
+}
+
+fn codex_credentials_needs_refresh_at(
+    access_token: &str,
+    last_refresh: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> bool {
+    if let Some(expires_at) = jwt_expiration(access_token) {
+        return expires_at
+            <= now + chrono::Duration::minutes(CODEX_ACCESS_TOKEN_REFRESH_WINDOW_MINUTES);
+    }
+
     let Some(last_refresh) = last_refresh else {
         return true;
     };
-    (Utc::now() - last_refresh).num_days() > 8
+    (now - last_refresh).num_days() > CODEX_TOKEN_REFRESH_INTERVAL_DAYS
+}
+
+fn jwt_expiration(token: &str) -> Option<DateTime<Utc>> {
+    let seconds = jwt_payload(token)?.get("exp")?.as_i64()?;
+    Utc.timestamp_opt(seconds, 0).single()
 }
 
 fn claude_credentials_expired(credentials: &ClaudeCredentials) -> bool {
@@ -5539,11 +5821,6 @@ fn claude_user_agent() -> &'static str {
 fn detect_claude_user_agent() -> String {
     let mut command = std::process::Command::new("claude");
     command.arg("--version");
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt as _;
-        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-    }
     command
         .output()
         .ok()
@@ -5596,8 +5873,16 @@ fn string_key(
         .map(str::to_string)
 }
 
-fn jwt_payload(token: &str) -> Option<Value> {
-    let payload = token.split('.').nth(1)?;
+/// Returns unverified claims; use them for identity only after the server has accepted the request.
+pub(crate) fn jwt_payload(token: &str) -> Option<Value> {
+    let mut parts = token.split('.');
+    let header = parts.next()?;
+    let payload = parts.next()?;
+    let signature = parts.next()?;
+    if header.is_empty() || payload.is_empty() || signature.is_empty() || parts.next().is_some() {
+        return None;
+    }
+
     let mut encoded = payload.replace('-', "+").replace('_', "/");
     while encoded.len() % 4 != 0 {
         encoded.push('=');
@@ -5716,6 +6001,107 @@ where
 mod tests {
     use super::*;
     use crate::agent_account_scope::test_support::TestRefreshScope;
+
+    /// The Codex half of the #345 pairing, driven through the real loader rather
+    /// than against the constant: a missing `auth.json` has to produce the exact
+    /// message `required_card_source` matches on, or the card reports `oauth`,
+    /// stops being a setup placeholder, and a machine that has never run Codex
+    /// gets a Codex tab again.
+    #[test]
+    fn absent_codex_auth_json_maps_to_an_unconfigured_card() {
+        let scope = TestRefreshScope::new("codex", "unconfigured-source");
+        let missing = scope.root().join("codex/auth.json");
+        assert!(!missing.exists(), "the probe path must not exist");
+
+        let display = load_codex_credentials_from(&missing).unwrap_err();
+        assert_eq!(display, CODEX_UNCONFIGURED_ERROR);
+        assert_eq!(
+            required_card_source(
+                &ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(display)),
+                CODEX_UNCONFIGURED_ERROR,
+            ),
+            "unconfigured"
+        );
+    }
+
+    /// The inverse of the assertion above, and the one that keeps this fix from
+    /// becoming the bug it removes. `read_to_string` fails for a permission
+    /// problem, a directory at the path, or invalid UTF-8 as well as for an
+    /// absent file. Those belong to an account that IS configured, so they must
+    /// not reach the marker: `required_card_source` would hand them
+    /// `unconfigured`, and the Codex card would leave the tab bar while telling
+    /// the user to run `codex` — the silent disappearance, with the reason
+    /// replaced by a wrong one. A directory is the reliably reproducible member
+    /// of that set.
+    #[test]
+    fn a_codex_auth_json_that_exists_but_cannot_be_read_keeps_its_card() {
+        let scope = TestRefreshScope::new("codex", "unreadable-source");
+        let unreadable = scope.root().join("codex/auth.json");
+        fs::create_dir_all(&unreadable).unwrap();
+        assert!(
+            unreadable.is_dir(),
+            "the fixture must not be a regular file"
+        );
+
+        let display = load_codex_credentials_from(&unreadable).unwrap_err();
+        assert_eq!(display, CODEX_CREDENTIALS_UNREADABLE_ERROR);
+        assert_ne!(display, CODEX_UNCONFIGURED_ERROR);
+        assert_eq!(
+            required_card_source(
+                &ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(display)),
+                CODEX_UNCONFIGURED_ERROR,
+            ),
+            "oauth",
+            "an unreadable credential is a configured account, and keeps its tab"
+        );
+    }
+
+    /// The control the `unconfigured` arm needs: everything that is not "there is
+    /// no credential" stays `oauth`, so a configured-but-failing card keeps its
+    /// tab. The transient case is the one that would hurt most — a card that
+    /// could not be reached must not read as one that was never set up, and the
+    /// display alone cannot tell them apart, which is why the arm matches the
+    /// variant too.
+    #[test]
+    fn required_card_source_keeps_oauth_for_everything_except_absence() {
+        let marker = CODEX_UNCONFIGURED_ERROR;
+        let transient_with_marker = ProviderFetchOutcome::Failure(ProviderFetchFailure::transient(
+            marker,
+            None,
+            SafeTransportDiagnostic::server_error(503),
+        ));
+        let other_terminal = ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(
+            "Codex auth.json exists but contains no OAuth tokens.",
+        ));
+        for outcome in [
+            transient_with_marker,
+            other_terminal,
+            ProviderFetchOutcome::Absent,
+        ] {
+            assert_eq!(required_card_source(&outcome, marker), "oauth");
+        }
+    }
+
+    /// The two required cards must not share a marker: matching Antigravity's
+    /// absence against Codex's message (or the reverse) would hand one provider
+    /// the other's verdict.
+    #[test]
+    fn required_card_markers_are_not_interchangeable() {
+        let antigravity = ProviderFetchOutcome::Failure(ProviderFetchFailure::terminal(
+            agent_antigravity::ANTIGRAVITY_UNCONFIGURED_ERROR,
+        ));
+        assert_eq!(
+            required_card_source(
+                &antigravity,
+                agent_antigravity::ANTIGRAVITY_UNCONFIGURED_ERROR
+            ),
+            "unconfigured"
+        );
+        assert_eq!(
+            required_card_source(&antigravity, CODEX_UNCONFIGURED_ERROR),
+            "oauth"
+        );
+    }
 
     /// The two properties `join_local_ordered` exists for, on futures that
     /// finish in the opposite order to the one they were given in — which is
@@ -5852,6 +6238,94 @@ mod tests {
                 string_key(map, "snake_key", "camelKey").as_deref(),
                 expected,
                 "{label}"
+            );
+        }
+    }
+
+    fn codex_test_access_token(exp: i64) -> String {
+        use base64::Engine as _;
+
+        let payload = serde_json::to_vec(&serde_json::json!({ "exp": exp })).unwrap();
+        format!(
+            "header.{}.signature",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload)
+        )
+    }
+
+    #[test]
+    fn codex_refresh_prefers_access_token_expiry_over_stale_last_refresh() {
+        let now = Utc.timestamp_opt(1_758_080_400, 0).single().unwrap();
+        let stale_last_refresh = Some(now - chrono::Duration::days(9));
+
+        assert!(!codex_credentials_needs_refresh_at(
+            &codex_test_access_token((now + chrono::Duration::minutes(6)).timestamp()),
+            stale_last_refresh,
+            now,
+        ));
+        assert!(codex_credentials_needs_refresh_at(
+            &codex_test_access_token((now + chrono::Duration::minutes(5)).timestamp()),
+            stale_last_refresh,
+            now,
+        ));
+        assert!(codex_credentials_needs_refresh_at(
+            &codex_test_access_token((now - chrono::Duration::seconds(1)).timestamp()),
+            Some(now - chrono::Duration::days(1)),
+            now,
+        ));
+    }
+
+    #[test]
+    fn codex_refresh_falls_back_to_last_refresh_without_valid_expiry() {
+        let now = Utc.timestamp_opt(1_758_080_400, 0).single().unwrap();
+
+        assert!(!codex_credentials_needs_refresh_at(
+            "not-a-jwt",
+            Some(now - chrono::Duration::days(8)),
+            now,
+        ));
+        assert!(codex_credentials_needs_refresh_at(
+            "not-a-jwt",
+            Some(now - chrono::Duration::days(9)),
+            now,
+        ));
+        assert!(codex_credentials_needs_refresh_at("not-a-jwt", None, now));
+        assert!(jwt_expiration("header.eyJleHAiOiJub3QtYS1udW1iZXIifQ.signature").is_none());
+    }
+
+    #[test]
+    fn jwt_payload_requires_exactly_three_nonempty_segments() {
+        let token = codex_test_access_token(1_758_080_400);
+        let payload = token.split('.').nth(1).unwrap();
+        assert_eq!(jwt_payload(&token).unwrap()["exp"], 1_758_080_400);
+
+        for malformed in [
+            format!("header.{payload}"),
+            format!("header.{payload}.signature.extra"),
+            format!(".{payload}.signature"),
+            format!("header.{payload}."),
+            "header..signature".to_string(),
+            format!("header.{payload}.signature."),
+        ] {
+            assert!(jwt_payload(&malformed).is_none(), "{malformed}");
+        }
+    }
+
+    #[test]
+    fn codex_refresh_uses_last_refresh_for_malformed_jwt_segments() {
+        let now = Utc.timestamp_opt(1_758_080_400, 0).single().unwrap();
+        let stale_last_refresh = Some(now - chrono::Duration::days(9));
+        let token = codex_test_access_token((now + chrono::Duration::hours(1)).timestamp());
+
+        assert!(!codex_credentials_needs_refresh_at(
+            &token,
+            stale_last_refresh,
+            now,
+        ));
+        let two_segments = token.rsplit_once('.').unwrap().0;
+        for malformed in [two_segments.to_string(), format!("{token}.extra")] {
+            assert!(
+                codex_credentials_needs_refresh_at(&malformed, stale_last_refresh, now),
+                "{malformed}"
             );
         }
     }
@@ -6096,13 +6570,13 @@ mod tests {
     }
 
     fn cache_test_snapshot(
-        client_id: &str,
+        client_id: ProviderId,
         account_scope: Result<AccountScope, AccountScopeError>,
         now: DateTime<Utc>,
     ) -> AgentUsageSnapshot {
         AgentUsageSnapshot {
             account_key: None,
-            client_id: client_id.to_string(),
+            client_id,
             source: "oauth".to_string(),
             updated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
             identity: Some(AgentIdentity {
@@ -6147,19 +6621,19 @@ mod tests {
             generated_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
             publication_generation: 1,
             agents: vec![
-                cache_test_snapshot("codex", Ok(trusted.clone()), now),
-                cache_test_snapshot("claude", Err(AccountScopeError::NoTrustedEvidence), now),
+                cache_test_snapshot(ProviderId::Codex, Ok(trusted.clone()), now),
+                cache_test_snapshot(ProviderId::Claude, Err(AccountScopeError::NoTrustedEvidence), now),
                 // Trusted scope, but the provider failed and these windows are
                 // its last-good replay — the identity was not confirmed by this
                 // run, so it must not become a binding.
                 {
-                    let mut stale = cache_test_snapshot("copilot", Ok(trusted.clone()), now);
+                    let mut stale = cache_test_snapshot(ProviderId::Copilot, Ok(trusted.clone()), now);
                     stale.error = Some("Copilot is unavailable.".to_string());
                     stale
                 },
                 // Trusted scope, degraded transport — same reasoning.
                 {
-                    let mut degraded = cache_test_snapshot("grok", Ok(trusted.clone()), now);
+                    let mut degraded = cache_test_snapshot(ProviderId::Grok, Ok(trusted.clone()), now);
                     degraded.transport_diagnostic =
                         Some(SafeTransportDiagnostic::server_error(503));
                     degraded
@@ -6223,7 +6697,7 @@ mod tests {
             agents: vec![AgentUsageSnapshot {
                 account_key: None,
                 windows,
-                ..cache_test_snapshot("claude", Ok(trusted.clone()), now)
+                ..cache_test_snapshot(ProviderId::Claude, Ok(trusted.clone()), now)
             }],
             opencode_subscriptions: Vec::new(),
         };
@@ -6275,7 +6749,7 @@ mod tests {
     fn claude_test_success_outcome() -> ProviderFetchOutcome {
         let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
         ProviderFetchOutcome::Success {
-            snapshot: cache_test_snapshot("claude", Err(AccountScopeError::NoTrustedEvidence), now),
+            snapshot: cache_test_snapshot(ProviderId::Claude, Err(AccountScopeError::NoTrustedEvidence), now),
             cache_binding: None,
         }
     }
@@ -6407,7 +6881,7 @@ mod tests {
         ] {
             assert!(matches!(
                 resolve_stored_claude_login(malformed, ClaudeCredentialSource::Keychain),
-                ClaudeLoginResolution::Terminal
+                ClaudeLoginResolution::Terminal(_)
             ));
         }
 
@@ -6506,7 +6980,7 @@ mod tests {
                 ClaudeLoginResolution::Absent => "absent",
                 ClaudeLoginResolution::ExplicitLogout => "explicit-logout",
                 ClaudeLoginResolution::Ready(_) => "ready",
-                ClaudeLoginResolution::Terminal => "terminal",
+                ClaudeLoginResolution::Terminal(_) => "terminal",
             };
             assert_eq!(actual, expected, "unexpected resolution for {raw}");
         }
@@ -6572,6 +7046,297 @@ mod tests {
         assert_eq!(setup_calls.get(), 1);
     }
 
+    /// What `security -w` prints for a value with a non-printable byte.
+    fn security_hex(value: &str) -> String {
+        value.bytes().map(|b| format!("{b:02x}")).collect()
+    }
+
+    const SENTINEL_LOGIN: &str = r#"{"claudeAiOauth":"SENTINEL"}"#;
+    const KEYCHAIN_EXIT_51: &str =
+        "Claude credentials could not be loaded: Keychain read failed (security exit 51).";
+
+    /// Issue #226: a login item holding "café" comes back from `security` as hex.
+    #[test]
+    fn issue_226_keychain_hex_output_decodes_to_the_stored_login() {
+        const CAFE_LOGIN: &str = r#"{"claudeAiOauth":{"accessToken":"fake-access","refreshToken":"fake-refresh","subscriptionType":"café"}}"#;
+        let stdout = format!("{}\n", security_hex(CAFE_LOGIN)).into_bytes();
+        let raw = claude_keychain_item_output(Some(0), stdout)
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw, CAFE_LOGIN);
+        assert!(matches!(
+            resolve_stored_claude_login(&raw, ClaudeCredentialSource::Keychain),
+            ClaudeLoginResolution::Ready(ref c) if c.subscription_type.as_deref() == Some("café")
+        ));
+
+        let ascii = r#"{"claudeAiOauth":{"accessToken":"fake-access"}}"#;
+        let stdout = format!("{ascii}\n").into_bytes();
+        assert_eq!(
+            claude_keychain_item_output(Some(0), stdout),
+            Ok(Some(ascii.to_string()))
+        );
+    }
+
+    #[test]
+    fn security_hex_decode_leaves_text_that_is_not_a_hex_rendering() {
+        // Control: the accepted shape does decode.
+        assert_eq!(
+            decode_security_hex_output("636166c3a9").as_deref(),
+            Some("café")
+        );
+        // Odd length, uppercase, not UTF-8, printable-only, plain text.
+        for text in ["636166c3a", "636166C3A9", "ff", "6162", "fake-token"] {
+            assert_eq!(decode_security_hex_output(text), None, "{text}");
+            let bytes = text.as_bytes().to_vec();
+            assert_eq!(
+                claude_keychain_item_output(Some(0), bytes.clone()),
+                Ok(Some(text.to_string()))
+            );
+            assert_eq!(
+                claude_raw_token_output(Some(0), bytes),
+                Ok(Some(text.to_string()))
+            );
+        }
+        // A JSON-number item ("1234") is also a valid hex rendering, so it now
+        // fails closed as malformed instead of reading as absent. Accepted in
+        // the C1 plan: no login item holds a bare number.
+        let raw = claude_keychain_item_output(Some(0), b"1234\n".to_vec())
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw, "\u{12}\u{34}");
+        assert!(matches!(
+            resolve_stored_claude_login(&raw, ClaudeCredentialSource::Keychain),
+            ClaudeLoginResolution::Terminal(ref d) if d == CLAUDE_STORED_LOGIN_MALFORMED_ERROR
+        ));
+    }
+
+    #[test]
+    fn claude_setup_token_hex_output_decodes_and_trims_again() {
+        let stdout = format!("{}\n", security_hex("fake-setup-token\n")).into_bytes();
+        assert_eq!(
+            claude_raw_token_output(Some(0), stdout),
+            Ok(Some("fake-setup-token".to_string()))
+        );
+        // Only whitespace once decoded: empty, not a token.
+        assert_eq!(
+            claude_raw_token_output(Some(0), b"0a0a\n".to_vec()),
+            Err(CLAUDE_SETUP_KEYCHAIN_EMPTY_ERROR.to_string())
+        );
+    }
+
+    /// Issue #225: every read failure names its class; the setup-token item's
+    /// messages never read as the login item's.
+    #[test]
+    fn claude_keychain_read_failures_carry_distinct_class_messages() {
+        let cases = [
+            (
+                Some(51),
+                vec![],
+                KEYCHAIN_EXIT_51,
+                "The Syrtis setup-token Keychain item could not be read (security exit 51).",
+            ),
+            (
+                None,
+                vec![],
+                CLAUDE_KEYCHAIN_SIGNAL_ERROR,
+                CLAUDE_SETUP_KEYCHAIN_SIGNAL_ERROR,
+            ),
+            (
+                Some(0),
+                vec![0xff],
+                CLAUDE_KEYCHAIN_NOT_TEXT_ERROR,
+                CLAUDE_SETUP_KEYCHAIN_NOT_TEXT_ERROR,
+            ),
+            (
+                Some(0),
+                b"\n".to_vec(),
+                CLAUDE_KEYCHAIN_EMPTY_ERROR,
+                CLAUDE_SETUP_KEYCHAIN_EMPTY_ERROR,
+            ),
+        ];
+        for (exit, stdout, login, setup) in cases {
+            assert_eq!(
+                claude_keychain_item_output(exit, stdout.clone()),
+                Err(login.to_string())
+            );
+            assert_eq!(
+                claude_raw_token_output(exit, stdout),
+                Err(setup.to_string())
+            );
+            assert_ne!(login, setup);
+        }
+        assert_ne!(
+            CLAUDE_KEYCHAIN_SPAWN_ERROR,
+            CLAUDE_SETUP_KEYCHAIN_SPAWN_ERROR
+        );
+        assert_eq!(
+            claude_keychain_item_output(Some(44), b"x".to_vec()),
+            Ok(None)
+        );
+        assert_eq!(claude_raw_token_output(Some(44), b"x".to_vec()), Ok(None));
+    }
+
+    /// Display test (c): each Terminal class survives resolution unchanged.
+    #[test]
+    fn claude_stored_login_terminal_carries_each_class_message() {
+        for class in [
+            CLAUDE_KEYCHAIN_SPAWN_ERROR,
+            KEYCHAIN_EXIT_51,
+            CLAUDE_KEYCHAIN_NOT_TEXT_ERROR,
+            CLAUDE_KEYCHAIN_EMPTY_ERROR,
+        ] {
+            let file_loads = std::cell::Cell::new(0);
+            let login = load_stored_claude_login_with(
+                || Err(class.to_string()),
+                || {
+                    file_loads.set(file_loads.get() + 1);
+                    Ok(None)
+                },
+            );
+            assert!(
+                matches!(login, ClaudeLoginResolution::Terminal(ref d) if d == class),
+                "{class}"
+            );
+            assert_eq!(file_loads.get(), 0);
+        }
+        let login = load_stored_claude_login_with(
+            || Ok(None),
+            || Err(CLAUDE_CREDENTIALS_FILE_UNREADABLE_ERROR.to_string()),
+        );
+        assert!(matches!(
+            login,
+            ClaudeLoginResolution::Terminal(ref d) if d == CLAUDE_CREDENTIALS_FILE_UNREADABLE_ERROR
+        ));
+        for (raw, expected) in [
+            ("{", CLAUDE_STORED_LOGIN_MALFORMED_ERROR),
+            (
+                r#"{"claudeAiOauth":{}}"#,
+                CLAUDE_STORED_LOGIN_NO_ACCESS_TOKEN_ERROR,
+            ),
+            (SENTINEL_LOGIN, CLAUDE_STORED_LOGIN_MALFORMED_ERROR),
+        ] {
+            assert!(
+                matches!(
+                    resolve_stored_claude_login(raw, ClaudeCredentialSource::Keychain),
+                    ClaudeLoginResolution::Terminal(ref d) if d == expected
+                ),
+                "{raw}"
+            );
+        }
+    }
+
+    /// Display tests (a) and (d): the Terminal text reaches the card verbatim,
+    /// and neither request runs.
+    #[tokio::test]
+    async fn claude_terminal_display_reaches_the_card_verbatim() {
+        let requests = std::cell::Cell::new(0);
+        let setup_loads = std::cell::Cell::new(0);
+        let (source, outcome) = fetch_claude_login_or_setup_with(
+            ClaudeLoginResolution::Terminal(CLAUDE_STORED_LOGIN_MALFORMED_ERROR.to_string()),
+            |_| async {
+                requests.set(requests.get() + 1);
+                ("oauth", claude_test_success_outcome())
+            },
+            || {
+                setup_loads.set(setup_loads.get() + 1);
+                Ok(Some(claude_test_setup_token()))
+            },
+            |_| async {
+                requests.set(requests.get() + 1);
+                ("setup-token", claude_test_success_outcome())
+            },
+        )
+        .await;
+        assert_eq!(source, "oauth");
+        assert!(matches!(
+            outcome,
+            ProviderFetchOutcome::Failure(ProviderFetchFailure::Terminal { ref display })
+                if display == CLAUDE_STORED_LOGIN_MALFORMED_ERROR
+        ));
+        assert_eq!((requests.get(), setup_loads.get()), (0, 0));
+
+        let (source, outcome) = fetch_claude_login_or_setup_with(
+            ClaudeLoginResolution::Absent,
+            |_| async {
+                requests.set(requests.get() + 1);
+                ("oauth", claude_test_success_outcome())
+            },
+            || Err(CLAUDE_SETUP_KEYCHAIN_EMPTY_ERROR.to_string()),
+            |_| async {
+                requests.set(requests.get() + 1);
+                ("setup-token", claude_test_success_outcome())
+            },
+        )
+        .await;
+        assert_eq!(source, "setup-token");
+        assert!(matches!(
+            outcome,
+            ProviderFetchOutcome::Failure(ProviderFetchFailure::Terminal { ref display })
+                if display == CLAUDE_SETUP_KEYCHAIN_EMPTY_ERROR
+        ));
+        assert_eq!(requests.get(), 0);
+    }
+
+    /// Display test (b) and config-dir class pass-through.
+    #[test]
+    fn claude_config_dir_account_shows_the_read_class_message() {
+        for class in [
+            CLAUDE_KEYCHAIN_SPAWN_ERROR,
+            KEYCHAIN_EXIT_51,
+            CLAUDE_KEYCHAIN_NOT_TEXT_ERROR,
+            CLAUDE_KEYCHAIN_EMPTY_ERROR,
+        ] {
+            let error = load_claude_config_dir_credentials_with(G_TEST_CONFIG_DIR, |_| {
+                Err(class.to_string())
+            })
+            .unwrap_err();
+            assert_eq!(error, class);
+        }
+        let error = load_claude_config_dir_credentials_with(G_TEST_CONFIG_DIR, |_| {
+            Ok(Some(SENTINEL_LOGIN.to_string()))
+        })
+        .unwrap_err();
+        assert_eq!(error, CLAUDE_STORED_LOGIN_MALFORMED_ERROR);
+    }
+
+    /// serde's invalid-type error quotes the value, i.e. credential bytes; no
+    /// card text may carry it, on the resolve path or the refresh reload path.
+    #[tokio::test]
+    async fn claude_malformed_login_error_never_quotes_the_stored_value() {
+        // Control: the fixture does trigger a quoting serde error.
+        let serde_error =
+            serde_json::from_str::<ClaudeCredentialsRoot>(SENTINEL_LOGIN).unwrap_err();
+        assert!(serde_error.to_string().contains("SENTINEL"));
+
+        assert_eq!(
+            parse_claude_credentials_data(SENTINEL_LOGIN, ClaudeCredentialSource::Keychain)
+                .unwrap_err(),
+            CLAUDE_STORED_LOGIN_MALFORMED_ERROR
+        );
+        assert!(matches!(
+            resolve_stored_claude_login(SENTINEL_LOGIN, ClaudeCredentialSource::Keychain),
+            ClaudeLoginResolution::Terminal(ref d) if !d.contains("SENTINEL")
+        ));
+
+        let scope = TestRefreshScope::new("claude", "sentinel-reload");
+        let failure = refresh_claude_credentials_with(
+            &claude_test_login_credentials(),
+            &scope,
+            |_| parse_claude_credentials_data(SENTINEL_LOGIN, ClaudeCredentialSource::Keychain),
+            |_, _| async { Err(ProviderFetchFailure::terminal("request must not run")) },
+            |_| Ok(()),
+            |_| Ok(()),
+            checkpoint_at(None),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            failure,
+            ProviderFetchFailure::Terminal { ref display } if display == CLAUDE_STORED_LOGIN_MALFORMED_ERROR
+        ));
+        scope.cleanup();
+    }
+
     fn timeout_diagnostic() -> SafeTransportDiagnostic {
         SafeTransportDiagnostic::from_facts(TransportErrorFacts::synthetic(
             true,
@@ -6593,12 +7358,12 @@ mod tests {
 
         apply_provider_outcome_with(
             &cache,
-            "copilot",
+            ProviderId::Copilot,
             None,
             "oauth",
             fresh_at,
             ProviderFetchOutcome::Success {
-                snapshot: cache_test_snapshot("copilot", Ok(account_scope.clone()), fresh_at),
+                snapshot: cache_test_snapshot(ProviderId::Copilot, Ok(account_scope.clone()), fresh_at),
                 cache_binding: Some(binding.clone()),
             },
             |_| {},
@@ -6623,7 +7388,7 @@ mod tests {
             Ok((plan, windows)) => ProviderFetchOutcome::Success {
                 snapshot: AgentUsageSnapshot {
                     account_key: None,
-                    client_id: "copilot".to_string(),
+                    client_id: ProviderId::Copilot,
                     source: "oauth".to_string(),
                     updated_at: response_at.to_rfc3339_opts(SecondsFormat::Millis, true),
                     identity: Some(AgentIdentity { email: None, plan }),
@@ -6640,14 +7405,14 @@ mod tests {
             Err(failure) => ProviderFetchOutcome::Failure(failure),
         };
         let snapshot =
-            apply_provider_outcome_with(&cache, "copilot", None, "oauth", response_at, outcome, |_| {})
+            apply_provider_outcome_with(&cache, ProviderId::Copilot, None, "oauth", response_at, outcome, |_| {})
                 .unwrap();
 
         assert!(snapshot.error.is_none());
         assert_eq!(snapshot.windows.len(), 1);
         assert!((snapshot.windows[0].remaining_percent - 60.0).abs() < 0.01);
         assert!(snapshot.windows[0].resets_at.is_none());
-        let cached = lock_last_good(&cache).entries[&account_slot("copilot", None)].snapshot.clone();
+        let cached = lock_last_good(&cache).entries[&account_slot(ProviderId::Copilot, None)].snapshot.clone();
         assert_eq!(cached.updated_at, snapshot.updated_at);
         assert_eq!(cached.windows.len(), 1);
         assert!(cached.error.is_none());
@@ -6730,7 +7495,7 @@ mod tests {
             data.cache_binding = Some(binding.clone());
             let fresh = apply_provider_outcome_with(
                 &cache,
-                "grok-bot",
+                ProviderId::GrokBot,
                 None,
                 "oauth",
                 now,
@@ -6744,7 +7509,7 @@ mod tests {
             let later = now + chrono::Duration::minutes(1);
             let result = apply_provider_outcome_with(
                 &cache,
-                "grok-bot",
+                ProviderId::GrokBot,
                 None,
                 "oauth",
                 later,
@@ -6819,7 +7584,7 @@ mod tests {
         let cache = Mutex::new(ProviderLastGoodCache::default());
         let snapshot = apply_provider_outcome_with(
             &cache,
-            "grok-bot",
+            ProviderId::GrokBot,
             None,
             grokbot_failure_source(&consent),
             now,
@@ -6849,12 +7614,12 @@ mod tests {
 
         let fresh = apply_provider_outcome_with(
             &cache,
-            "codex",
+            ProviderId::Codex,
             None,
             "oauth",
             fresh_at,
             ProviderFetchOutcome::Success {
-                snapshot: cache_test_snapshot("codex", Ok(account_scope), fresh_at),
+                snapshot: cache_test_snapshot(ProviderId::Codex, Ok(account_scope), fresh_at),
                 cache_binding: Some(binding.clone()),
             },
             |snapshot| {
@@ -6880,7 +7645,7 @@ mod tests {
 
         let fallback = apply_provider_outcome_with(
             &cache,
-            "codex",
+            ProviderId::Codex,
             None,
             "oauth",
             failure_at,
@@ -6929,7 +7694,7 @@ mod tests {
 
         let cached = lock_last_good(&cache)
             .entries
-            .get(&account_slot("codex", None))
+            .get(&account_slot(ProviderId::Codex, None))
             .unwrap()
             .snapshot
             .clone();
@@ -6939,7 +7704,7 @@ mod tests {
 
         let fallback_again = apply_provider_outcome_with(
             &cache,
-            "codex",
+            ProviderId::Codex,
             None,
             "oauth",
             failure_at + chrono::Duration::minutes(1),
@@ -6957,7 +7722,7 @@ mod tests {
 
         let dns_fallback = apply_provider_outcome_with(
             &cache,
-            "codex",
+            ProviderId::Codex,
             None,
             "oauth",
             failure_at + chrono::Duration::minutes(2),
@@ -7006,12 +7771,12 @@ mod tests {
 
         let fresh = apply_provider_outcome_with(
             &cache,
-            "opencode",
+            ProviderId::OpenCode,
             None,
             "api",
             fresh_at,
             ProviderFetchOutcome::Success {
-                snapshot: cache_test_snapshot("opencode", Ok(account_scope), fresh_at),
+                snapshot: cache_test_snapshot(ProviderId::OpenCode, Ok(account_scope), fresh_at),
                 cache_binding: Some(binding.clone()),
             },
             |_| {},
@@ -7022,11 +7787,11 @@ mod tests {
         // The success reached the cache under the opencode slot.
         assert!(lock_last_good(&cache)
             .entries
-            .contains_key(&account_slot("opencode", None)));
+            .contains_key(&account_slot(ProviderId::OpenCode, None)));
 
         let fallback = apply_provider_outcome_with(
             &cache,
-            "opencode",
+            ProviderId::OpenCode,
             None,
             "api",
             failure_at,
@@ -7067,19 +7832,19 @@ mod tests {
             let cache = Mutex::new(ProviderLastGoodCache::default());
             apply_provider_outcome_with(
                 &cache,
-                "codex",
+                ProviderId::Codex,
                 None,
                 "oauth",
                 now,
                 ProviderFetchOutcome::Success {
-                    snapshot: cache_test_snapshot("codex", Ok(scope_a.clone()), now),
+                    snapshot: cache_test_snapshot(ProviderId::Codex, Ok(scope_a.clone()), now),
                     cache_binding: Some(binding_a.clone()),
                 },
                 |_| {},
             );
             let result = apply_provider_outcome_with(
                 &cache,
-                "codex",
+                ProviderId::Codex,
                 None,
                 "oauth",
                 now + chrono::Duration::seconds(1),
@@ -7088,25 +7853,25 @@ mod tests {
             )
             .unwrap();
             assert!(result.windows.is_empty());
-            assert!(!lock_last_good(&cache).entries.contains_key(&account_slot("codex", None)));
+            assert!(!lock_last_good(&cache).entries.contains_key(&account_slot(ProviderId::Codex, None)));
         }
 
         let cache = Mutex::new(ProviderLastGoodCache::default());
         apply_provider_outcome_with(
             &cache,
-            "codex",
+            ProviderId::Codex,
             None,
             "oauth",
             now,
             ProviderFetchOutcome::Success {
-                snapshot: cache_test_snapshot("codex", Ok(scope_a), now),
+                snapshot: cache_test_snapshot(ProviderId::Codex, Ok(scope_a), now),
                 cache_binding: Some(binding_a),
             },
             |_| {},
         );
         assert!(apply_provider_outcome_with(
             &cache,
-            "codex",
+            ProviderId::Codex,
             None,
             "oauth",
             now,
@@ -7114,7 +7879,7 @@ mod tests {
             |_| panic!("absent must not enrich"),
         )
         .is_none());
-        assert!(!lock_last_good(&cache).entries.contains_key(&account_slot("codex", None)));
+        assert!(!lock_last_good(&cache).entries.contains_key(&account_slot(ProviderId::Codex, None)));
         scope.cleanup();
     }
 
@@ -7130,25 +7895,25 @@ mod tests {
         let cache = Mutex::new(ProviderLastGoodCache::default());
         apply_provider_outcome_with(
             &cache,
-            "antigravity",
+            ProviderId::Antigravity,
             None,
             "oauth",
             now,
             ProviderFetchOutcome::Success {
-                snapshot: cache_test_snapshot("antigravity", Ok(account_scope.clone()), now),
+                snapshot: cache_test_snapshot(ProviderId::Antigravity, Ok(account_scope.clone()), now),
                 cache_binding: Some(binding.clone()),
             },
             |_| {},
         );
         let anonymous = apply_provider_outcome_with(
             &cache,
-            "antigravity",
+            ProviderId::Antigravity,
             None,
             "local",
             now,
             ProviderFetchOutcome::Success {
                 snapshot: cache_test_snapshot(
-                    "antigravity",
+                    ProviderId::Antigravity,
                     Err(AccountScopeError::NoTrustedEvidence),
                     now,
                 ),
@@ -7158,25 +7923,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(anonymous.windows.len(), 1);
-        assert!(!lock_last_good(&cache).entries.contains_key(&account_slot("antigravity", None)));
+        assert!(!lock_last_good(&cache).entries.contains_key(&account_slot(ProviderId::Antigravity, None)));
 
         apply_provider_outcome_with(
             &cache,
-            "antigravity",
+            ProviderId::Antigravity,
             None,
             "oauth",
             now,
             ProviderFetchOutcome::Success {
-                snapshot: cache_test_snapshot("antigravity", Ok(account_scope.clone()), now),
+                snapshot: cache_test_snapshot(ProviderId::Antigravity, Ok(account_scope.clone()), now),
                 cache_binding: Some(binding.clone()),
             },
             |_| {},
         );
-        let mut empty = cache_test_snapshot("antigravity", Ok(account_scope.clone()), now);
+        let mut empty = cache_test_snapshot(ProviderId::Antigravity, Ok(account_scope.clone()), now);
         empty.windows.clear();
         let live_empty = apply_provider_outcome_with(
             &cache,
-            "antigravity",
+            ProviderId::Antigravity,
             None,
             "oauth",
             now,
@@ -7188,16 +7953,16 @@ mod tests {
         )
         .unwrap();
         assert!(live_empty.windows.is_empty());
-        assert!(!lock_last_good(&cache).entries.contains_key(&account_slot("antigravity", None)));
+        assert!(!lock_last_good(&cache).entries.contains_key(&account_slot(ProviderId::Antigravity, None)));
 
         apply_provider_outcome_with(
             &cache,
-            "antigravity",
+            ProviderId::Antigravity,
             None,
             "oauth",
             now,
             ProviderFetchOutcome::Success {
-                snapshot: cache_test_snapshot("antigravity", Ok(account_scope), now),
+                snapshot: cache_test_snapshot(ProviderId::Antigravity, Ok(account_scope), now),
                 cache_binding: Some(binding),
             },
             |_| {},
@@ -7205,13 +7970,13 @@ mod tests {
         let enrich_calls = std::cell::Cell::new(0);
         let invalid = apply_provider_outcome_with(
             &cache,
-            "antigravity",
+            ProviderId::Antigravity,
             None,
             "oauth",
             now,
             ProviderFetchOutcome::Success {
                 snapshot: cache_test_snapshot(
-                    "antigravity",
+                    ProviderId::Antigravity,
                     Err(AccountScopeError::MetadataRead),
                     now,
                 ),
@@ -7222,7 +7987,7 @@ mod tests {
         .unwrap();
         assert!(invalid.windows.is_empty());
         assert_eq!(enrich_calls.get(), 0);
-        assert!(!lock_last_good(&cache).entries.contains_key(&account_slot("antigravity", None)));
+        assert!(!lock_last_good(&cache).entries.contains_key(&account_slot(ProviderId::Antigravity, None)));
         scope.cleanup();
     }
 
@@ -7322,12 +8087,12 @@ mod tests {
 
         apply_provider_outcome_with(
             &cache,
-            "kiro",
+            ProviderId::Kiro,
             None,
             "oauth",
             fresh_at,
             ProviderFetchOutcome::Success {
-                snapshot: cache_test_snapshot("kiro", Ok(account_scope), fresh_at),
+                snapshot: cache_test_snapshot(ProviderId::Kiro, Ok(account_scope), fresh_at),
                 cache_binding: Some(binding.clone()),
             },
             |_| {},
@@ -7336,7 +8101,7 @@ mod tests {
 
         let fallback = apply_provider_outcome_with(
             &cache,
-            "kiro",
+            ProviderId::Kiro,
             None,
             "oauth",
             failure_at,
@@ -7362,15 +8127,10 @@ mod tests {
 
     #[tokio::test]
     async fn verified_binding_failure_prevents_every_provider_request() {
-        for provider in [
-            "codex",
-            "claude",
-            "grok",
-            "copilot",
-            "antigravity",
-            "kiro",
-            "opencode",
-        ] {
+        // The ids label one generic call rather than dispatching per provider;
+        // walking the table keeps the label list from drifting (it had lost
+        // grok-bot) without claiming more coverage than the call gives.
+        for provider in QUOTA_PROVIDERS.iter().map(|provider| provider.id.as_str()) {
             let sends = std::cell::Cell::new(0);
             let result: Result<(), &str> =
                 request_after_verified_binding(Err::<(), _>("scope unavailable"), |()| async {
@@ -7381,6 +8141,169 @@ mod tests {
             assert_eq!(result, Err("scope unavailable"), "{provider}");
             assert_eq!(sends.get(), 0, "{provider}");
         }
+    }
+
+    // ---- #324: the provider table is the single registration point ----
+
+    fn table_test_snapshot(client_id: ProviderId) -> AgentUsageSnapshot {
+        cache_test_snapshot(
+            client_id,
+            Err(AccountScopeError::NoTrustedEvidence),
+            Utc.timestamp_opt(1_800_000_000, 0).single().unwrap(),
+        )
+    }
+
+    fn ids(snapshots: &[AgentUsageSnapshot]) -> Vec<&str> {
+        snapshots.iter().map(|s| s.client_id.as_str()).collect()
+    }
+
+    fn stub(snapshots: Vec<AgentUsageSnapshot>) -> ProviderFetch {
+        provider_fetch(async move { snapshots })
+    }
+
+    #[test]
+    fn the_provider_table_is_todays_card_order() {
+        // Pinned on purpose. The consistency checks walk the table, so they
+        // stop checking a provider that is REMOVED from it; this is the check
+        // that covers every provider for that case (a few older selftests
+        // happen to name codex, kiro and opencode directly).
+        let ids: Vec<&str> = QUOTA_PROVIDERS.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["codex", "claude", "antigravity", "copilot", "grok", "grok-bot", "kiro", "opencode", "deepseek"]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetches_land_in_table_order_whatever_order_they_finish_in() {
+        let slow_first = provider_fetch(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            vec![table_test_snapshot(ProviderId::Test("a"))]
+        });
+        let out = fetch_in_order(vec![slow_first, stub(vec![table_test_snapshot(ProviderId::Test("b"))])]).await;
+        assert_eq!(ids(&out), ["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_fetch_contributes_no_card_and_a_multi_account_fetch_keeps_its_order() {
+        let out = fetch_in_order(vec![
+            stub(vec![table_test_snapshot(ProviderId::Test("a"))]),
+            stub(Vec::new()),
+            stub(vec![table_test_snapshot(ProviderId::Test("c1")), table_test_snapshot(ProviderId::Test("c2"))]),
+        ])
+        .await;
+        assert_eq!(ids(&out), ["a", "c1", "c2"]);
+    }
+
+    #[tokio::test]
+    async fn fetches_run_concurrently() {
+        // Each stub finishes only after the other has started, so awaiting
+        // them one after another deadlocks and the timeout fails the test.
+        let (a_started, a_seen) = tokio::sync::oneshot::channel::<()>();
+        let (b_started, b_seen) = tokio::sync::oneshot::channel::<()>();
+        let a = provider_fetch(async move {
+            a_started.send(()).unwrap();
+            b_seen.await.unwrap();
+            vec![table_test_snapshot(ProviderId::Test("a"))]
+        });
+        let b = provider_fetch(async move {
+            b_started.send(()).unwrap();
+            a_seen.await.unwrap();
+            vec![table_test_snapshot(ProviderId::Test("b"))]
+        });
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            fetch_in_order(vec![a, b]),
+        )
+        .await
+        .expect("fetches must be polled concurrently");
+        assert_eq!(ids(&out), ["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn each_fetch_is_handed_its_own_entry_id() {
+        // Each stub publishes whatever id it is handed, so the output ids are
+        // exactly the ids `fetch_table` passed in.
+        fn echo(id: ProviderId) -> ProviderFetch {
+            provider_fetch(async move {
+                vec![empty_error_snapshot(id, None, "fixture", Utc::now(), String::new(), None)]
+            })
+        }
+        let table = [
+            QuotaProvider { id: ProviderId::Test("first"), fetch: echo },
+            QuotaProvider { id: ProviderId::Test("second"), fetch: echo },
+        ];
+        assert_eq!(ids(&fetch_table(&table).await), ["first", "second"]);
+    }
+
+    #[test]
+    fn the_caller_id_is_stamped_on_a_successful_snapshot() {
+        // A snapshot built under another id is published under the caller's
+        // id. The slot is computed from the caller's id either way; what the
+        // stamp changes is the published id and the `usable_success` verdict
+        // that decides whether the snapshot is cached in that slot.
+        let scope = TestRefreshScope::new("kiro", "kiro-stamp");
+        let account_scope = scope
+            .resolve_current("fixture", "account-a", b"marker-a")
+            .unwrap();
+        let binding = ProviderCacheBinding::primary(account_scope.clone());
+        let cache = Mutex::new(ProviderLastGoodCache::default());
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let built_under = ProviderId::Test("written-by-the-fetch");
+        let fixture = cache_test_snapshot(built_under, Ok(account_scope), now);
+        // Control: the fixture really carries the other id going in.
+        assert_eq!(fixture.client_id, built_under);
+        let snapshot = apply_provider_outcome_with(
+            &cache,
+            ProviderId::Kiro,
+            None,
+            "oauth",
+            now,
+            ProviderFetchOutcome::Success {
+                snapshot: fixture,
+                cache_binding: Some(binding),
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(snapshot.client_id, ProviderId::Kiro);
+        let cache = lock_last_good(&cache);
+        assert!(cache.entries.contains_key(&account_slot(ProviderId::Kiro, None)));
+    }
+
+    #[test]
+    fn every_provider_in_the_table_has_a_usable_success_rule() {
+        // A missing arm no longer compiles (the match is exhaustive); this
+        // checks that each arm accepts its provider's success shape.
+        let base = table_test_snapshot(ProviderId::Test("any")).windows[0].clone();
+        let card = |id: &str| base.clone().with_identity(id, Some(id.to_string()), None, None);
+        for provider in QUOTA_PROVIDERS {
+            let mut snapshot = table_test_snapshot(provider.id);
+            snapshot.windows = vec![
+                card("session.v1"),
+                card("billing.weekly.v1"),
+                card(agent_grokbot::WEEKLY_WINDOW_KEY),
+            ];
+            if provider.id == ProviderId::DeepSeek {
+                snapshot.balance = Some(BalanceSnapshot {
+                    currency: "CNY".to_string(),
+                    total: 10.0,
+                    granted: Some(0.0),
+                    topped_up: Some(10.0),
+                    is_available: true,
+                });
+            }
+            assert!(
+                usable_success(&snapshot),
+                "{} has no usable_success rule; a transient failure would drop its last-good card",
+                provider.id.as_str()
+            );
+        }
+        // Control: the same success shape under the test-only fixture id is
+        // refused, so a success shape alone does not make an arm pass.
+        let mut stranger = table_test_snapshot(ProviderId::Test("not-a-provider"));
+        stranger.windows = vec![card("session.v1")];
+        assert!(!usable_success(&stranger));
     }
 
     #[derive(Debug)]
@@ -8058,7 +8981,7 @@ mod tests {
             .unwrap();
         let mut snapshot = AgentUsageSnapshot {
             account_key: None,
-            client_id: "codex".to_string(),
+            client_id: ProviderId::Codex,
             source: "fixture".to_string(),
             updated_at: String::new(),
             identity: None,
@@ -8367,116 +9290,6 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "temp file not cleaned up");
 
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(target_os = "windows")]
-    fn open_without_delete_sharing(path: &Path) -> fs::File {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-
-        let mut options = fs::OpenOptions::new();
-        options
-            .read(true)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
-        options.open(path).unwrap()
-    }
-
-    #[cfg(target_os = "windows")]
-    fn atomic_temp_path(dir: &Path) -> Option<PathBuf> {
-        fs::read_dir(dir)
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .find(|entry| entry.file_name().to_string_lossy().contains(".tmp."))
-            .map(|entry| entry.path())
-    }
-
-    #[cfg(target_os = "windows")]
-    fn lock_staged_atomic_temp(dir: &Path) -> Option<fs::File> {
-        use std::os::windows::fs::OpenOptionsExt as _;
-
-        let mut options = fs::OpenOptions::new();
-        options.read(true).share_mode(0);
-        options.open(atomic_temp_path(dir)?).ok()
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn atomic_write_retries_transient_windows_destination_lock() {
-        use std::time::{Duration, Instant};
-
-        let dir = std::env::temp_dir().join(format!(
-            "tb_atomic_windows_transient_{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("auth.json");
-        fs::write(&path, "old").unwrap();
-        let destination_lock = open_without_delete_sharing(&path);
-
-        let writer_path = path.clone();
-        let writer = std::thread::spawn(move || atomic_write(&writer_path, "new"));
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let staged_temp_lock = loop {
-            if let Some(file) = lock_staged_atomic_temp(&dir) {
-                break Some(file);
-            }
-            if writer.is_finished() || Instant::now() >= deadline {
-                break None;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        };
-        let staged_temp_locked = staged_temp_lock.is_some();
-        if staged_temp_locked {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        let waited_for_retry = !writer.is_finished();
-        drop(staged_temp_lock);
-        drop(destination_lock);
-        let result = writer.join().expect("atomic writer thread panicked");
-
-        assert!(
-            staged_temp_locked,
-            "atomic write never completed temp-file staging"
-        );
-        assert!(
-            waited_for_retry,
-            "atomic write did not retry the sharing denial"
-        );
-        result.unwrap();
-        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
-        assert!(atomic_temp_path(&dir).is_none(), "temp file not cleaned up");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn atomic_write_exhausts_windows_retry_budget_without_losing_original() {
-        use std::time::{Duration, Instant};
-
-        let dir = std::env::temp_dir().join(format!(
-            "tb_atomic_windows_persistent_{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("auth.json");
-        fs::write(&path, "old").unwrap();
-        let destination_lock = open_without_delete_sharing(&path);
-
-        let started = Instant::now();
-        let result = atomic_write(&path, "new");
-        let elapsed = started.elapsed();
-        drop(destination_lock);
-
-        assert!(result.is_err(), "persistent sharing denial must fail");
-        assert!(
-            elapsed >= Duration::from_millis(80),
-            "atomic write returned before exhausting the retry budget: {elapsed:?}"
-        );
-        assert_eq!(fs::read_to_string(&path).unwrap(), "old");
-        assert!(atomic_temp_path(&dir).is_none(), "temp file not cleaned up");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -9167,7 +9980,7 @@ mod tests {
         let expected_scope = account_scope.as_str().to_string();
         let mut snapshot = AgentUsageSnapshot {
             account_key: None,
-            client_id: "claude".to_string(),
+            client_id: ProviderId::Claude,
             source: "oauth".to_string(),
             updated_at: String::new(),
             identity: None,
@@ -9289,7 +10102,7 @@ mod tests {
         );
         let mut snapshot = AgentUsageSnapshot {
             account_key: None,
-            client_id: "claude".to_string(),
+            client_id: ProviderId::Claude,
             source: "oauth".to_string(),
             updated_at: String::new(),
             identity: None,
@@ -11357,7 +12170,7 @@ mod tests {
         };
         let mut snapshot = AgentUsageSnapshot {
             account_key: None,
-            client_id: "fixture".to_string(),
+            client_id: ProviderId::Test("fixture"),
             source: "fixture".to_string(),
             updated_at: String::new(),
             identity: None,
@@ -11416,7 +12229,7 @@ mod tests {
         };
         let mut snapshot = AgentUsageSnapshot {
             account_key: None,
-            client_id: "fixture".to_string(),
+            client_id: ProviderId::Test("fixture"),
             source: "fixture".to_string(),
             updated_at: String::new(),
             identity: None,
@@ -11491,7 +12304,7 @@ mod tests {
         let reset = Utc.timestamp_opt(now + 86_400, 0).single().unwrap();
         let mut snapshot = AgentUsageSnapshot {
             account_key: None,
-            client_id: "fixture".to_string(),
+            client_id: ProviderId::Test("fixture"),
             source: "fixture".to_string(),
             updated_at: String::new(),
             identity: None,
@@ -11580,7 +12393,7 @@ mod tests {
         let reset = Utc.timestamp_opt(now + 86_400, 0).single().unwrap();
         let mut snapshot = AgentUsageSnapshot {
             account_key: None,
-            client_id: "fixture".to_string(),
+            client_id: ProviderId::Test("fixture"),
             source: "fixture".to_string(),
             updated_at: String::new(),
             identity: None,
@@ -11636,7 +12449,7 @@ mod tests {
         let reset = Utc.timestamp_opt(now + 86_400, 0).single().unwrap();
         let mut snapshot = AgentUsageSnapshot {
             account_key: None,
-            client_id: "fixture".to_string(),
+            client_id: ProviderId::Test("fixture"),
             source: "fixture".to_string(),
             updated_at: String::new(),
             identity: None,
@@ -11760,7 +12573,7 @@ mod tests {
         let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
         let mut snapshot = AgentUsageSnapshot {
             account_key: None,
-            client_id: "fixture".to_string(),
+            client_id: ProviderId::Test("fixture"),
             source: "fixture".to_string(),
             updated_at: String::new(),
             identity: None,
@@ -11862,7 +12675,7 @@ mod tests {
             let sampled_at = start + index as i64 * 900;
             let mut snapshot = AgentUsageSnapshot {
                 account_key: None,
-                client_id: "claude".to_string(),
+                client_id: ProviderId::Claude,
                 source: "oauth".to_string(),
                 updated_at: String::new(),
                 identity: None,
@@ -11975,7 +12788,7 @@ mod tests {
         let start = 1_800_000_000_i64;
         let mut snapshot = AgentUsageSnapshot {
             account_key: None,
-            client_id: "antigravity".to_string(),
+            client_id: ProviderId::Antigravity,
             source: "cli".to_string(),
             updated_at: String::new(),
             identity: None,
@@ -12001,6 +12814,78 @@ mod tests {
             snapshot.windows[0].pace_status.state,
             PaceState::Unavailable
         );
+        scope.cleanup();
+    }
+
+    /// A verified account whose history scope failed to resolve is a storage
+    /// failure, reported as `history` rather than `accountScope`: Swift stops
+    /// reading the curve of an `accountScope` window, and this one may already
+    /// have recorded cycles.
+    #[test]
+    fn verified_account_with_unresolved_history_scope_reports_history() {
+        let scope = TestRefreshScope::new("antigravity", "histid-history-scope-failed");
+        let account_scope = scope
+            .resolve_authoritative("antigravity", AuthoritativeIdKind::Email, "a@example.com")
+            .unwrap();
+        let start = 1_800_000_000_i64;
+        let mut snapshot = AgentUsageSnapshot {
+            account_key: None,
+            client_id: ProviderId::Antigravity,
+            source: "local".to_string(),
+            updated_at: String::new(),
+            identity: None,
+            account_scope: Ok(account_scope),
+            history_scope: Err(AccountScopeError::StorageUnavailable),
+            windows: vec![histid_window(20.0, start + 5 * 3_600, start)],
+            credits: None,
+            balance: None,
+            error: None,
+            transport_diagnostic: None,
+        };
+        let calls = std::cell::Cell::new(0);
+        enrich_snapshot_with(&mut snapshot, start, |_, _, _| {
+            calls.set(calls.get() + 1);
+            Ok(Vec::new())
+        });
+        assert_eq!(calls.get(), 0);
+        assert_eq!(snapshot.windows[0].pace_status.reason.as_deref(), Some("history"));
+        assert_eq!(snapshot.windows[0].pace_status.state, PaceState::Unavailable);
+        scope.cleanup();
+    }
+
+    /// A verified account with no history identity on purpose (a Grok Bot
+    /// token with no subject) records nothing, ever: it stays `accountScope`,
+    /// so Swift does not report its missing curve as a failed read. The
+    /// snapshot's provider is incidental; the mapping does not depend on it.
+    #[test]
+    fn verified_account_without_history_identity_reports_account_scope() {
+        let scope = TestRefreshScope::new("claude", "histid-history-scope-untrusted");
+        let account_scope = scope
+            .resolve_authoritative("claude", AuthoritativeIdKind::Email, "a@example.com")
+            .unwrap();
+        let start = 1_800_000_000_i64;
+        let mut snapshot = AgentUsageSnapshot {
+            account_key: Some("/tmp/extra".to_string()),
+            client_id: ProviderId::Claude,
+            source: "oauth".to_string(),
+            updated_at: String::new(),
+            identity: None,
+            account_scope: Ok(account_scope),
+            history_scope: Err(AccountScopeError::NoTrustedEvidence),
+            windows: vec![histid_window(20.0, start + 5 * 3_600, start)],
+            credits: None,
+            balance: None,
+            error: None,
+            transport_diagnostic: None,
+        };
+        let calls = std::cell::Cell::new(0);
+        enrich_snapshot_with(&mut snapshot, start, |_, _, _| {
+            calls.set(calls.get() + 1);
+            Ok(Vec::new())
+        });
+        assert_eq!(calls.get(), 0);
+        assert_eq!(snapshot.windows[0].pace_status.reason.as_deref(), Some("accountScope"));
+        assert_eq!(snapshot.windows[0].pace_status.state, PaceState::Unavailable);
         scope.cleanup();
     }
 
@@ -12158,8 +13043,8 @@ mod tests {
         // overwrites the other's fallback — one account's state stored under
         // another's name, which nothing downstream can detect.
         assert_ne!(
-            account_slot("claude", Some(spaced)),
-            account_slot("claude", Some(trimmed)),
+            account_slot(ProviderId::Claude, Some(spaced)),
+            account_slot(ProviderId::Claude, Some(trimmed)),
             "the last-good cache slot was derived from the trimmed path"
         );
 
@@ -12200,20 +13085,20 @@ mod tests {
             .unwrap();
         let binding = ProviderCacheBinding::primary(scope_primary.clone());
 
-        let primary = account_slot("claude", None);
-        let second = account_slot("claude", Some("/Users/someone/.claude-work"));
+        let primary = account_slot(ProviderId::Claude, None);
+        let second = account_slot(ProviderId::Claude, Some("/Users/someone/.claude-work"));
         assert_ne!(primary, second, "the account dimension collapsed");
 
         let cache = Mutex::new(ProviderLastGoodCache::default());
         lock_last_good(&cache).replace(
             &primary,
             binding.clone(),
-            cache_test_snapshot("claude", Ok(scope_primary.clone()), now),
+            cache_test_snapshot(ProviderId::Claude, Ok(scope_primary.clone()), now),
         );
         lock_last_good(&cache).replace(
             &second,
             binding.clone(),
-            cache_test_snapshot("claude", Ok(scope_second.clone()), now),
+            cache_test_snapshot(ProviderId::Claude, Ok(scope_second.clone()), now),
         );
 
         let recovered = lock_last_good(&cache)
@@ -12344,7 +13229,7 @@ mod tests {
         );
         AgentUsageSnapshot {
             account_key: identity.account_key.clone(),
-            client_id: "claude".to_string(),
+            client_id: ProviderId::Claude,
             source: "oauth".to_string(),
             updated_at: now_date.to_rfc3339_opts(SecondsFormat::Millis, true),
             identity: None,
@@ -12690,7 +13575,7 @@ mod tests {
         let account_scope = scope
             .resolve_current("fixture", "g5-account", b"g5-marker")
             .unwrap();
-        let primary = cache_test_snapshot("claude", Ok(account_scope.clone()), now);
+        let primary = cache_test_snapshot(ProviderId::Claude, Ok(account_scope.clone()), now);
         let json = serde_json::to_string(&primary).unwrap();
         assert!(
             !json.contains("accountKey"),
@@ -12704,7 +13589,7 @@ mod tests {
         // The field is not dead: an extra account does carry it.
         let extra = AgentUsageSnapshot {
             account_key: Some(G_TEST_CONFIG_DIR.to_string()),
-            ..cache_test_snapshot("claude", Ok(account_scope), now)
+            ..cache_test_snapshot(ProviderId::Claude, Ok(account_scope), now)
         };
         let extra_json = serde_json::to_string(&extra).unwrap();
         assert!(
@@ -12738,11 +13623,11 @@ mod tests {
         let round_three = round_two + chrono::Duration::seconds(60);
         let cache = Mutex::new(ProviderLastGoodCache::default());
 
-        let primary_snapshot = cache_test_snapshot("claude", Ok(primary_scope.clone()), round_one);
+        let primary_snapshot = cache_test_snapshot(ProviderId::Claude, Ok(primary_scope.clone()), round_one);
         let primary_updated_at = primary_snapshot.updated_at.clone();
         apply_provider_outcome_with(
             &cache,
-            "claude",
+            ProviderId::Claude,
             None,
             "oauth",
             round_one,
@@ -12756,14 +13641,14 @@ mod tests {
 
         apply_provider_outcome_with(
             &cache,
-            "claude",
+            ProviderId::Claude,
             Some(G_TEST_CONFIG_DIR),
             "oauth",
             round_two,
             ProviderFetchOutcome::Success {
                 snapshot: AgentUsageSnapshot {
                     account_key: Some(G_TEST_CONFIG_DIR.to_string()),
-                    ..cache_test_snapshot("claude", Ok(extra_scope.clone()), round_two)
+                    ..cache_test_snapshot(ProviderId::Claude, Ok(extra_scope.clone()), round_two)
                 },
                 cache_binding: Some(extra_binding.clone()),
             },
@@ -12773,7 +13658,7 @@ mod tests {
 
         let recovered = apply_provider_outcome_with(
             &cache,
-            "claude",
+            ProviderId::Claude,
             None,
             "oauth",
             round_three,
@@ -12803,7 +13688,7 @@ mod tests {
         // The extra account kept its own entry through all three rounds.
         assert!(
             lock_last_good(&cache)
-                .clean_for(&account_slot("claude", Some(G_TEST_CONFIG_DIR)), &extra_binding)
+                .clean_for(&account_slot(ProviderId::Claude, Some(G_TEST_CONFIG_DIR)), &extra_binding)
                 .is_some()
         );
         scope.cleanup();
@@ -12952,7 +13837,7 @@ mod tests {
             publication_generation: 1,
             agents: vec![AgentUsageSnapshot {
                 account_key: None,
-                client_id: "provider-fixture.invalid".to_string(),
+                client_id: ProviderId::Test("provider-fixture.invalid"),
                 source: "fixture.invalid".to_string(),
                 updated_at: "2026-07-10T12:00:00.000Z".to_string(),
                 identity: None,

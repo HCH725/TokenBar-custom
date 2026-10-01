@@ -137,6 +137,18 @@ public struct PaceStatus: Decodable, Sendable, Equatable {
     public let completeCycles: Int
     public let reason: UsagePaceUnavailableReason?
 
+    /// The key to read this window's quota curve with, or nil when the engine
+    /// records no history for it. `accountScope` is the engine's mark for an
+    /// account with no trusted history identity (`enrich_snapshot_with`): the
+    /// `agy` CLI route of Antigravity, or a Grok Bot token with no subject.
+    /// Such a window is neither recorded nor bound, so its curve read throws
+    /// "binding is unavailable" on every publication, and reading it anyway
+    /// reported a permanent absence as a failed read that "will be retried".
+    /// A storage failure is reported as `history` instead and is still read.
+    public var historyKey: String? {
+        state == .unavailable && reason == .accountScope ? nil : windowKey
+    }
+
     public init(
         state: UsagePaceState,
         windowKey: String? = nil,
@@ -518,6 +530,18 @@ public struct AgentUsageTransportDiagnostic: Decodable, Sendable {
     }
 }
 
+/// The instructions an unconfigured card shows. A value rather than a view so
+/// the choice is assertable — see `AgentUsageSnapshot.setupInstructions`.
+public enum SetupInstructions: Equatable, Sendable {
+    /// Claude's setup-token / Keychain instructions, which name Claude-only
+    /// environment and Keychain identifiers and belong to no other provider.
+    case claudeSetupToken
+    /// The provider's own one-line instruction, as it arrived in `error`.
+    case providerMessage(String)
+    /// Not an unconfigured card, or one with nothing to say.
+    case none
+}
+
 public struct AgentUsageSnapshot: Decodable, Sendable {
     public let clientId: String
     /// Which account of `clientId` this card is. Absent from the payload — and
@@ -600,6 +624,28 @@ public struct AgentUsageSnapshot: Decodable, Sendable {
         case "keychain-consent", "keychain-denied": "Allow"
         default: nil
         }
+    }
+
+    /// What an unconfigured card offers as instructions.
+    ///
+    /// Here rather than as a branch in the card's view body, for the reason
+    /// `setupBadgeKey` gives one paragraph up. Claude's copy names
+    /// `CLAUDE_CODE_OAUTH_TOKEN` and a `tokenbar-claude-oauth-token` Keychain
+    /// item, and neither exists for any other provider — but Claude was the only
+    /// client that could report `unconfigured` when that copy was written, so the
+    /// view showed it unconditionally. Codex and Antigravity now report it too
+    /// (#345), and a branch living in a `ViewBuilder` is one nothing can assert:
+    /// the next provider to reach this state would have inherited Claude's
+    /// Keychain instructions with no test to notice.
+    ///
+    /// Every other provider already states its own one-line instruction in
+    /// `error` ("Run `codex` to log in", "Re-login in Antigravity"), so it says
+    /// that instead of borrowing Claude's.
+    public var setupInstructions: SetupInstructions {
+        guard source == "unconfigured" else { return .none }
+        if clientId == "claude" { return .claudeSetupToken }
+        guard let error, !error.isEmpty else { return .none }
+        return .providerMessage(error)
     }
 
     /// Order-preserving card view shared by quota resolvers and consumers.
@@ -782,12 +828,26 @@ package struct AgentUsageTransportLogEntry: Equatable, Sendable {
     package let osCode: Int32?
 }
 
-private let agentUsageTransportLogClientIds: Set<String> = [
-    // "grok-bot", "kiro" and "opencode" carry the Grok Bot, Kiro and OpenCode
-    // Go subscription quotas; keep their transport diagnostics attributable
-    // instead of rewriting them to "unknown" like an unsupported id.
-    "codex", "claude", "antigravity", "copilot", "grok", "grok-bot", "kiro", "opencode",
-]
+/// Payload of `tb_quota_provider_ids`: `{"ids": [...]}`.
+public struct QuotaProviderIds: Decodable, Sendable {
+    public let ids: [String]
+}
+
+/// The client ids whose transport diagnostics keep their name in the log; any
+/// other id is written as "unknown". Derived from the engine's provider table
+/// rather than listed here, so a new provider is attributable the moment it is
+/// registered (#324). If the engine cannot answer, the set is empty and every
+/// id logs as "unknown": the same fail-closed treatment an unlisted id always
+/// had, never a raw id that was not vetted.
+private let agentUsageTransportLogClientIds: Set<String> = {
+    // A failed call is already logged by `TBCore.unwrap`; an empty success is
+    // not, and it would silently anonymize every provider for the process.
+    let ids = Set((try? TBCore.quotaProviderIds()) ?? [])
+    if ids.isEmpty {
+        ffiLog.error("quota provider ids unavailable; transport diagnostics log as unknown")
+    }
+    return ids
+}()
 
 private let agentUsageTransportLogCategories: Set<String> = [
     "timeout", "dns", "tls", "connectionRefused", "connectionReset",
