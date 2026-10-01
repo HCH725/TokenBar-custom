@@ -1,10 +1,10 @@
 #!/bin/bash
-# Assemble TokenBar.app from the SwiftPM release build.
+# Assemble Syrtis.app from the SwiftPM release build.
 #
 #   scripts/bundle.sh [marketing-version] [build-number]
 #
 # Run from the repo root. Since v1.0.0 there is a single app identity
-# (TokenBar.app / com.nyanako.tokenbar) — prereleases ship through the same
+# (Syrtis.app / com.nyanako.tokenbar) — prereleases ship through the same
 # bundle on the Sparkle "beta" channel instead of a side-by-side app. The
 # retired beta identity (com.nyanako.tokenbar.beta / "TokenBar Beta.app")
 # is migrated from on first launch.
@@ -13,10 +13,10 @@ set -euo pipefail
 VERSION="${1:-1.0.0}"
 BUILD_NUMBER="${2:-100}"
 BUNDLE_ID="${BUNDLE_ID:-com.nyanako.tokenbar}"
-APP_NAME="${APP_DISPLAY:-TokenBar}"
+APP_NAME="${APP_DISPLAY:-Syrtis}"
 # Overridable so a build can sit somewhere other than beside the release
 # artifact without changing its identity. `make selftest-bundled` uses it to
-# assemble a real `TokenBar.app` — same identifier, same CFBundleName — in a
+# assemble a real `Syrtis.app` — same identifier, same CFBundleName — in a
 # subdirectory, rather than renaming the app to avoid the collision.
 OUT_DIR="${OUT_DIR:-dist}"
 APP="$OUT_DIR/$APP_NAME.app"
@@ -33,13 +33,13 @@ mkdir -p "$OUT_DIR"
 touch "$OUT_DIR/.metadata_never_index"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 
-cp .build/release/TokenBar "$APP/Contents/MacOS/TokenBar"
+cp .build/release/Syrtis "$APP/Contents/MacOS/Syrtis"
 # SwiftPM resource bundle (animation frames, agent icons).
-cp -R .build/release/TokenBar_TokenBar.bundle "$APP/Contents/Resources/"
+cp -R .build/release/Syrtis_Syrtis.bundle "$APP/Contents/Resources/"
 # Localizations land in the *main* bundle for packaged runs. Bare `swift run`
 # stages the same .lproj directories from the SwiftPM resource bundle before
 # SwiftUI creates any views.
-cp -R Sources/TokenBar/Resources/Localizations/*.lproj "$APP/Contents/Resources/"
+cp -R Sources/Syrtis/Resources/Localizations/*.lproj "$APP/Contents/Resources/"
 # Brand icon, shared with the Tauri app.
 if [ -f assets/icon.icns ]; then
   cp assets/icon.icns "$APP/Contents/Resources/icon.icns"
@@ -77,7 +77,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>TokenBar</string>
+    <string>Syrtis</string>
     <key>CFBundleIdentifier</key>
     <string>$BUNDLE_ID</string>
     <key>CFBundleName</key>
@@ -108,6 +108,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
          upstream releases are merged into this repo before local deployment. -->
     <key>TokenBarOfficialUpdatesEnabled</key>
     <false/>
+    <!-- Provider quota HTTPS can cross a VPN interface macOS treats as a
+         local network. Conditional on purpose: not every VPN prompts, and
+         the sentence does not claim the traffic stays on this machine. -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Syrtis connects to your providers to read quota information. When your VPN routes this traffic through a local network, macOS may ask for local network access.</string>
     <key>NSHumanReadableCopyright</key>
     <string>MIT License</string>
     <key>SUEnableInstallerLauncherService</key>
@@ -119,12 +124,27 @@ cat > "$APP/Contents/Info.plist" <<PLIST
          The old TokenBar-Native path keeps redirecting here for existing
          beta installs (the name is never reclaimed). -->
     <key>SUFeedURL</key>
-    <string>https://raw.githubusercontent.com/Nanako0129/TokenBar/main/appcast.xml</string>
+    <string>https://raw.githubusercontent.com/Nanako0129/syrtis/main/appcast.xml</string>
 </dict>
 </plist>
 PLIST
 
-echo "==> ad-hoc codesign"
-codesign --force --deep --sign - "$APP"
+# Sparkle's XPC services exist for sandboxed apps. Syrtis is not sandboxed and
+# leaves SUEnableInstallerLauncherService off, so they never run; Sparkle's
+# docs allow removing them, which also spares signing Downloader.xpc with its
+# own entitlements.
+rm -rf "$APP/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices" \
+       "$APP/Contents/Frameworks/Sparkle.framework/XPCServices"
+
+# SIGN_IDENTITY set (e.g. "Developer ID Application: … (TEAMID)"): sign for
+# notarization (see codesign_app.sh). Unset: ad-hoc, which is what local builds
+# and the release workflow's `build` job use; the release signs in `sign`.
+if [ -n "${SIGN_IDENTITY:-}" ]; then
+  echo "==> codesign: $SIGN_IDENTITY"
+  "$(dirname "$0")/codesign_app.sh" "$APP" "$SIGN_IDENTITY"
+else
+  echo "==> ad-hoc codesign"
+  codesign --force --deep --sign - "$APP"
+fi
 
 echo "==> done: $APP"

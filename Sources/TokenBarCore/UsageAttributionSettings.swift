@@ -4,7 +4,7 @@ import Foundation
 public enum UsageAttributionSettings {
     public enum Copy {
         public static let section = "Usage attribution"
-        public static let classifyHint = "Classify each observed client/provider source against the subscription it should count toward. Nothing here is inferred as a billing event."
+        public static let classifyHint = "Pick which subscription each source's usage counts toward. This only changes how Syrtis groups your usage; it doesn't read your bills."
         /// Two facts about provider identity, deliberately in one hint, and
         /// both hedged for a reason.
         ///
@@ -17,14 +17,13 @@ public enum UsageAttributionSettings {
         /// classifiable source. Neither half can be stated flatly: "nothing is
         /// merged" is false for Claude Code, and "Codex is reported as OpenAI"
         /// is false for OpenClaw. Hence "some clients".
-        public static let canonicalizationHint = "Provider IDs are compared exactly as the source emitted them, so related-looking routes may appear as separate rows and be classified independently. Some clients merge them before reporting — Vertex AI arriving as Anthropic, Codex as OpenAI — and a row that arrived merged cannot be split here."
-        public static let declarationHint = "A declaration is your classification, not a billing fact."
-        public static let noRows = "No provider-split usage in this range."
+        public static let canonicalizationHint = "Providers are matched exactly as each tool reports them, so similar ones can appear on separate rows. Some tools merge providers before reporting (Vertex AI shows up as Anthropic, Codex as OpenAI), and those rows can't be split."
+        public static let noRows = "No usage in this range lists a provider."
         /// The report request finished without one. Distinct from `noRows`,
         /// which is an answer about a report that did arrive.
-        public static let unavailable = "Usage could not be loaded, so there is nothing to classify yet."
+        public static let unavailable = "Usage couldn't be loaded."
         public static let acceptSuggestions = "Accept all suggestions (%lld)"
-        public static let suggestionsHint = "Suggestions are proposals; they do not change your classification until accepted."
+        public static let suggestionsHint = "Suggestions apply only when you accept them."
         public static let source = "%@ · %@"
         public static let observed = "Observed %@ tokens · %@"
         public static let classification = "Classification"
@@ -38,7 +37,7 @@ public enum UsageAttributionSettings {
 
         public static var all: [String] {
             [
-                section, classifyHint, canonicalizationHint, declarationHint, noRows, unavailable,
+                section, classifyHint, canonicalizationHint, noRows, unavailable,
                 acceptSuggestions, suggestionsHint, source, observed, classification,
                 unassigned, excluded, assigned, suggested, suggestedExcluded, unspecifiedProvider,
                 classificationFor,
@@ -164,7 +163,7 @@ public enum UsageAttributionSettings {
     ///   `open-weights`, never `openai`.
     ///
     /// Only clients in `ClientRegistry` appear here; the survey covered more
-    /// products than TokenBar recognises.
+    /// products than Syrtis recognises.
     public static let subscriptionProviderMap: [String: Set<String>] = [
         // Single-vendor plans: the vendor's own product.
         "claude": ["anthropic"],
@@ -371,7 +370,7 @@ public enum UsageAttributionSettings {
     /// Clients that route through subscriptions they do not own, keyed to the
     /// subscription clients they are authed against.
     ///
-    /// opencode is the only one TokenBar can know this for, because its
+    /// opencode is the only one Syrtis can know this for, because its
     /// `auth.json` oauth entries are reported as `opencodeSubscriptions`. That
     /// declaration is what separates it from every other multi-provider source:
     /// a Cursor row is Cursor's own plan, but an opencode row was paid for by
@@ -408,9 +407,9 @@ public enum UsageAttributionSettings {
 
         // Own subscription wins, and asking the table directly rather than
         // `owners` is the point: `owners` is filtered by `subscriptionClients`,
-        // which lists only clients TokenBar has a quota snapshot for. Attribution
+        // which lists only clients Syrtis has a quota snapshot for. Attribution
         // answers who paid, not who has a gauge — Cursor's own plan covers the
-        // Anthropic models it serves whether or not TokenBar can draw its meter.
+        // Anthropic models it serves whether or not Syrtis can draw its meter.
         // Requiring a snapshot here is what made a Cursor row fall through and
         // get proposed against someone else's subscription entirely.
         if subscriptionProviderMap[sourceOwner]?.contains(provider) == true {
@@ -493,6 +492,77 @@ public enum UsageAttributionSettings {
             return UsageAttribution.Record(
                 client: row.client, provider: row.provider, state: proposed)
         }
+    }
+
+    /// What the onboarding card shows: up to one acceptance record per
+    /// unassigned source that has a suggestion, plus how many unassigned
+    /// sources have none. Built from the same `suggestionRecords` /
+    /// `rows` / `acceptanceRecords` the Settings page uses — this does not
+    /// re-derive the policy, only reads its result for a surface that has no
+    /// stored suggestions table of its own to consult.
+    public struct OnboardingSummary: Equatable, Sendable {
+        public let records: [UsageAttribution.Record]
+        public let unsuggestedCount: Int
+
+        public init(records: [UsageAttribution.Record], unsuggestedCount: Int) {
+            self.records = records
+            self.unsuggestedCount = unsuggestedCount
+        }
+    }
+
+    public static func onboardingSummary(
+        entries: [ModelReportEntry],
+        confirmed: [UsageAttribution.Record],
+        subscriptionClients: [String],
+        routedSubscriptions: RoutedSubscriptions = [:]
+    ) -> OnboardingSummary {
+        let suggestions = suggestionRecords(
+            entries: entries, confirmed: confirmed,
+            subscriptionClients: subscriptionClients, routedSubscriptions: routedSubscriptions)
+        let allRows = rows(entries: entries, confirmed: confirmed, suggestions: suggestions)
+        let unassignedCount = allRows.reduce(into: 0) { count, row in
+            if case .unassigned = row.state { count += 1 }
+        }
+        let records = acceptanceRecords(rows: allRows)
+        return OnboardingSummary(records: records, unsuggestedCount: unassignedCount - records.count)
+    }
+
+    /// The accept-all WRITE path: confirm every proposed record, then remove
+    /// each one from the suggestions table so it stops being offered again.
+    /// Both Settings' "Accept all" button and the onboarding card call this —
+    /// it is the one place that decides what gets written, so the two
+    /// surfaces cannot drift into confirming records by different rules.
+    ///
+    /// Returns the failure message to show, or nil on success (including the
+    /// no-op success of an empty `records`). Confirmed and suggestions are
+    /// only written once both raw encodings succeed, so a rejected write
+    /// never leaves the two tables inconsistent with each other.
+    public static func accept(
+        _ records: [UsageAttribution.Record], defaults: UserDefaults = .standard
+    ) -> String? {
+        guard !records.isEmpty else { return nil }
+
+        let confirmedTable = UsageAttribution.confirmed(defaults: defaults)
+        let confirmedRaw = UsageAttribution.confirmedRaw(
+            updating: defaults.object(forKey: UsageAttribution.confirmedKey), records: records)
+        guard let confirmedRaw else {
+            return writeFailure(table: confirmedTable, records: records, result: confirmedRaw)?.message
+        }
+
+        let removals = records.map {
+            UsageAttribution.Record(
+                client: $0.client, provider: $0.provider, model: $0.model, state: .unassigned)
+        }
+        let suggestionsTable = UsageAttribution.suggestions(defaults: defaults)
+        let suggestionsRaw = UsageAttribution.suggestionsRaw(
+            updating: defaults.object(forKey: UsageAttribution.suggestionsKey), records: removals)
+        guard let suggestionsRaw else {
+            return writeFailure(table: suggestionsTable, records: removals, result: suggestionsRaw)?.message
+        }
+
+        defaults.set(confirmedRaw, forKey: UsageAttribution.confirmedKey)
+        defaults.set(suggestionsRaw, forKey: UsageAttribution.suggestionsKey)
+        return nil
     }
 
     public static func writeFailure(

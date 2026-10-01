@@ -49,6 +49,28 @@ pub(crate) const PHASE_BUCKET_MULTIPLE: usize = 4;
 /// Ceiling for `phase_bucket_count`, and what a long window actually gets.
 pub(crate) const MAX_PHASE_BUCKET_COUNT: usize = PHASE_BUCKET_COUNT * PHASE_BUCKET_MULTIPLE;
 pub(crate) const GRID_POINT_COUNT: usize = 169;
+/// How many samples one transaction may drop to make a store writable again.
+///
+/// A store can become invalid through no fault of the sample being recorded:
+/// `normalize_reset` and `sample_key` derive their quantum from a sample's own
+/// `duration_seconds`, so a series holding both a contract duration and a
+/// learned one is bucketed two ways, and a set that was valid can stop being
+/// valid the moment eviction changes it. Refusing the write leaves the history
+/// permanently unwritable and every window reporting "history unavailable",
+/// which is what #370 measured.
+///
+/// The floor of the allowance, not the whole of it: `repair_drop_allowance`
+/// takes the larger of this and `MAX_REPAIR_DROP_PERCENT` of the series. It
+/// exists so a short series, where a percentage rounds to nothing, still has a
+/// workable allowance.
+pub(crate) const MAX_REPAIR_DROPS_PER_TRANSACTION: usize = 8;
+
+/// The share of one series a repair may drop. 2% keeps the measured #370 case
+/// inside the allowance (39 of 5815 samples, 0.67%) while still refusing the
+/// failure this bound exists for: shredding a history to force a write through.
+/// Raise it only against a measurement, never to make a particular store pass.
+pub(crate) const MAX_REPAIR_DROP_PERCENT: usize = 2;
+
 pub(crate) const MAX_SERIES: usize = 512;
 pub(crate) const MAX_SAMPLES: usize = 65_536;
 pub(crate) const MAX_SAMPLES_PER_CYCLE: usize = PHASE_BUCKET_COUNT;
@@ -57,6 +79,18 @@ pub(crate) const MAX_PHASE_GAP: f64 = 0.30;
 pub(crate) const RETENTION_MIN_SECONDS: i64 = 56 * 86_400;
 pub(crate) const RETENTION_MAX_SECONDS: i64 = 400 * 86_400;
 pub(crate) const RETENTION_MIN_CYCLES: usize = 8;
+
+/// How many groups retention keeps purely as a record — ones
+/// `retention_cycle_descriptor` refuses, so no curve will ever be fitted to
+/// them.
+///
+/// Its own budget, separate from `retention_limits`' cycle count, so a record
+/// can never evict a cycle the model would have used. The floor rather than
+/// the cap: a record earns its place by being recent and substantial, not by
+/// being one of a long history, and the cases this exists for — a reset the
+/// provider revised, a window whose tail a write outage swallowed — arrive one
+/// or two at a time.
+pub(crate) const RETENTION_RECORD_GROUPS: usize = RETENTION_MIN_CYCLES;
 pub(crate) const RETENTION_MAX_CYCLES: usize = 128;
 pub(crate) const RUNOUT_THRESHOLD_PERCENT: f64 = 100.0 - 1e-9;
 pub(crate) const EPSILON: f64 = 1e-9;
@@ -72,12 +106,6 @@ thread_local! {
 enum StorageMode {
     System,
     Generic,
-}
-
-impl StorageMode {
-    fn uses_windows_secure_storage(self) -> bool {
-        cfg!(target_os = "windows") && matches!(self, Self::System)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,6 +436,13 @@ struct LegacyV2Store {
 struct LoadedStore {
     store: Store,
     quarantined: bool,
+    /// The loader changed the store it parsed: `drop_unplaceable_samples`
+    /// dropped a sample or `repair_store_at` ran. A transaction saves when this
+    /// is set even if its body changes nothing, so a repair reaches disk once
+    /// instead of re-running on every load and leaving the file readable only
+    /// by a build that repeats it (#207). The v3 → v4 version stamp does not
+    /// set it; that upgrade stays lazy, see `migrate_store_to_current`.
+    repaired: bool,
 }
 
 /// Record a provider-neutral quota observation in the production v3 store.
@@ -452,10 +487,6 @@ pub(crate) fn record_observation_and_evaluate(
 
 pub(crate) fn production_history_path() -> Option<PathBuf> {
     let preferred = dirs::data_dir()?.join("com.nyanako.tokenbar");
-    #[cfg(target_os = "windows")]
-    let directory =
-        crate::agent_storage_windows::resolve_secure_storage_directory(&preferred).ok()?;
-    #[cfg(not(target_os = "windows"))]
     let directory = preferred;
     Some(directory.join(HISTORY_FILE_NAME))
 }
@@ -519,10 +550,6 @@ pub(crate) fn migrate_codex_v2(
     else {
         return Err(HistoryError::StorageUnavailable);
     };
-    #[cfg(target_os = "windows")]
-    let destination = crate::agent_storage_windows::resolve_secure_storage_directory(&preferred)
-        .map_err(|_| HistoryError::StorageUnavailable)?;
-    #[cfg(not(target_os = "windows"))]
     let destination = preferred.clone();
     migrate_codex_v2_at_paths_with_clock_and_mode(
         request_account_id,
@@ -1872,6 +1899,84 @@ fn validate_store(store: &Store) -> bool {
         && store.series.iter().all(validate_series)
 }
 
+/// Drop the fewest samples that make every series valid again, or report that
+/// it cannot be done within the bound.
+///
+/// Every rule applied here is the one `validate_series` enforces, read through
+/// the same functions: a duplicate `sample_key`, and a cycle carrying more
+/// samples than `phase_bucket_count` allows. Oldest first, so the reading that
+/// has been stored longest is the one kept and the newest observation — the
+/// one this transaction exists to record — is never the casualty.
+///
+/// Returns `None` when the repair would exceed one series' `repair_drop_allowance`
+/// or when the result still fails validation, leaving the caller to refuse the
+/// write as it did before. Silence is not an option either way: a store that
+/// needs more than a handful of drops is a different problem, and this must not
+/// be the thing that hides it.
+fn repair_invalid_series(store: &mut Store, now: i64) -> Option<usize> {
+    let mut dropped = 0usize;
+    for series in &mut store.series {
+        if validate_series(series) {
+            continue;
+        }
+        let mut ordered = series.samples.clone();
+        ordered.sort_by(sample_order);
+        let mut keys: BTreeSet<(i64, usize)> = BTreeSet::new();
+        let mut counts: BTreeMap<i64, usize> = BTreeMap::new();
+        let mut kept: Vec<QuotaSample> = Vec::with_capacity(ordered.len());
+        let mut series_dropped = 0usize;
+        for sample in ordered {
+            // Reserve the key only for a sample that is kept. Both the key and
+            // the cap are derived from `duration_seconds`, and `sample_order`
+            // sorts by `reset_at` before `duration_seconds`, so a short sample
+            // (cap 48) can be cap-rejected ahead of a long one (cap 192) that
+            // shares its key and is under its own cap. Inserting first made
+            // that long sample a duplicate of a sample nobody kept, costing a
+            // drop that was not needed -- and drops are what the allowance
+            // spends before it refuses the write entirely.
+            let key = sample_key(&sample);
+            if keys.contains(&key) {
+                series_dropped += 1;
+                continue;
+            }
+            let reset = normalize_reset(sample.reset_at, sample.duration_seconds);
+            let count = counts.entry(reset).or_default();
+            if *count + 1 > phase_bucket_count(sample.duration_seconds) {
+                series_dropped += 1;
+                continue;
+            }
+            keys.insert(key);
+            *count += 1;
+            kept.push(sample);
+        }
+        // The allowance is a share of the series, not a flat count, because the
+        // two quantities it has to separate scale with the series. Measured on
+        // the store that produced #370: `claude/session.v1` needed 39 drops out
+        // of 5815 samples (0.67%) after ten different `duration_seconds` values
+        // bucketed one window ten ways, while the case this must still refuse —
+        // a history being shredded — takes most of the series with it. A flat
+        // bound cannot hold both ends: 8 refused the real repair and left every
+        // provider's card dark for ever, and a flat 64 would be no bound at all
+        // on a series of 80.
+        if series_dropped > repair_drop_allowance(series.samples.len()) {
+            return None;
+        }
+        dropped += series_dropped;
+        series.samples = kept;
+        if let Some(newest) = series.samples.iter().map(|s| s.sampled_at).max() {
+            series.last_activity_at = series.last_activity_at.max(newest);
+        }
+    }
+    validate_store_at(store, now).then_some(dropped)
+}
+
+/// How many samples a repair may drop from one series: `MAX_REPAIR_DROP_PERCENT`
+/// of it, never fewer than `MAX_REPAIR_DROPS_PER_TRANSACTION` so that a short
+/// series still has a workable allowance.
+fn repair_drop_allowance(samples: usize) -> usize {
+    (samples * MAX_REPAIR_DROP_PERCENT / 100).max(MAX_REPAIR_DROPS_PER_TRANSACTION)
+}
+
 fn validate_store_at(store: &Store, now: i64) -> bool {
     validate_store(store)
         && store
@@ -1929,8 +2034,13 @@ fn rollover_activity_at(rollover: &ObservedState) -> i64 {
 /// The newest sample wins a key collision, matching `admit`, which replaces
 /// within a bucket rather than appending. Order is preserved otherwise, so a
 /// store that needed no repair comes out byte-identical.
-fn drop_unplaceable_samples(mut store: Store) -> Store {
+///
+/// Also returns whether anything was dropped. Every branch that does not push
+/// a sample drops one, so "fewer kept than offered" is exactly that.
+fn drop_unplaceable_samples(mut store: Store) -> (Store, bool) {
+    let mut dropped = false;
     for series in &mut store.series {
+        let offered = series.samples.len();
         let mut seen: BTreeMap<(i64, usize), usize> = BTreeMap::new();
         let mut per_cycle: BTreeMap<i64, usize> = BTreeMap::new();
         let mut kept: Vec<QuotaSample> = Vec::with_capacity(series.samples.len());
@@ -1955,9 +2065,10 @@ fn drop_unplaceable_samples(mut store: Store) -> Store {
             seen.insert(key, kept.len());
             kept.push(sample);
         }
+        dropped |= kept.len() < offered;
         series.samples = kept;
     }
-    store
+    (store, dropped)
 }
 
 fn repair_store_at(mut store: Store, upper_bound: i64, observation_now: i64) -> Store {
@@ -1965,20 +2076,21 @@ fn repair_store_at(mut store: Store, upper_bound: i64, observation_now: i64) -> 
         observation_now <= upper_bound,
         "repair_store_at requires observation_now <= upper_bound"
     );
-    // A series whose own sample evidence leads the ceiling cannot be
-    // verified against any clock the reader trusts; drop it wholesale so a
-    // sibling's history is not held hostage by it.
-    store.series.retain(|series| {
-        !series
-            .samples
-            .iter()
-            .any(|sample| sample.sampled_at > upper_bound)
-    });
-
     for series in &mut store.series {
         if series.last_activity_at <= upper_bound {
             continue; // gated: a series at or below the ceiling is untouched
         }
+        // A sample stamped past the ceiling cannot be verified against any
+        // clock the reader trusts, so it goes. Only the sample: the ceiling
+        // comes from the wall clock, and a clock that stepped back produces
+        // exactly this shape, so dropping the whole series (as #206 did)
+        // erased a history nothing was wrong with, and any later save made
+        // that permanent. The gate above is enough to find every such sample:
+        // `validate_store` has already passed, and its `activity_valid` puts
+        // `last_activity_at` at or above every `sampled_at`.
+        series
+            .samples
+            .retain(|sample| sample.sampled_at <= upper_bound);
         if series
             .rollover
             .as_ref()
@@ -1994,6 +2106,8 @@ fn repair_store_at(mut store: Store, upper_bound: i64, observation_now: i64) -> 
             .into_iter()
             .chain(series.rollover.as_ref().map(rollover_activity_at))
             .max();
+        // `observation_now`, unless a surviving sample or rollover activity
+        // sits between it and the ceiling, in which case that one.
         let clamped = series.last_activity_at.min(observation_now);
         series.last_activity_at = floor.map_or(clamped, |floor| floor.max(clamped));
     }
@@ -2177,7 +2291,17 @@ fn cycle_profile(reset_at: i64, samples: &[QuotaSample], now: i64) -> Option<Cyc
         .and_then(|descriptor| cycle_profile_from_descriptor(&descriptor))
 }
 
-fn retention_cycles(series: &SeriesState, now: i64) -> Vec<RetentionCycleDescriptor> {
+/// Every sample group the series holds except the one the window is still
+/// inside.
+///
+/// This answers the RETENTION question — what stays on disk — and it is
+/// deliberately not the modelling question. `retention_cycles` narrows this to
+/// the groups a pace curve can be fitted to, which is a strictly smaller set:
+/// `retention_cycle_descriptor` refuses a group whose reset sits in the future
+/// and one whose samples do not reach the end of the window. Those are real
+/// readings either way, and `retain_series` keeps them rather than deleting
+/// them for failing a test about modelling (#370).
+fn retainable_groups(series: &SeriesState, now: i64) -> Vec<(i64, Vec<QuotaSample>)> {
     let active_future = series.active_reset_at.filter(|reset| *reset > now);
     grouped_samples(&series.samples)
         .into_iter()
@@ -2188,6 +2312,31 @@ fn retention_cycles(series: &SeriesState, now: i64) -> Vec<RetentionCycleDescrip
                     .any(|sample| is_active_group_sample(active, sample))
             })
         })
+        .collect()
+}
+
+/// Whether a group holds enough distinct readings to be worth keeping once it
+/// can no longer be modelled.
+///
+/// This is a strict superset of what `retention_cycle_descriptor` accepts —
+/// that function already requires `MIN_COMPLETE_BUCKETS` distinct buckets — so
+/// one predicate covers both the cycles a curve is fitted to and the groups
+/// that are only a record. The line it draws is substance, not modelability:
+/// the two groups #370 lost held 51 readings each, while a reset the provider
+/// moved backward leaves one or two samples stranded against a reset that will
+/// never arrive, and those stay discardable.
+fn group_holds_substance(samples: &[QuotaSample]) -> bool {
+    samples
+        .iter()
+        .map(|sample| sample_key(sample).1)
+        .collect::<BTreeSet<_>>()
+        .len()
+        >= MIN_COMPLETE_BUCKETS
+}
+
+fn retention_cycles(series: &SeriesState, now: i64) -> Vec<RetentionCycleDescriptor> {
+    retainable_groups(series, now)
+        .into_iter()
         .filter_map(|(reset_at, samples)| retention_cycle_descriptor(reset_at, &samples, now))
         .collect()
 }
@@ -2328,14 +2477,48 @@ fn retain_series(series: &mut SeriesState, now: i64) {
     let nominal = series_nominal_duration(series, now);
     let (retained_cycles, horizon) = retention_limits(nominal);
     let cutoff = now.saturating_sub(horizon);
-    let mut keep_completed = retention_cycles(series, now)
-        .iter()
-        .filter(|cycle| cycle.reset_at >= cutoff)
+    // Two budgets, because the groups have two jobs. `retained_cycles` is the
+    // modelling budget and only cycles a curve can be fitted to may spend it;
+    // a group kept purely as a record gets its own, so it cannot cost
+    // `historical_cycles` a cycle it would have drawn from. Sharing one budget
+    // looks harmless until it is full, which is where a real store lives:
+    // `claude/session.v1` on the store behind #370 holds 133 groups against a
+    // cap of 128.
+    let modelable = retention_cycles(series, now)
+        .into_iter()
         .map(|cycle| cycle.reset_at)
+        .collect::<BTreeSet<_>>();
+    let mut keep_completed = modelable
+        .iter()
+        .copied()
+        .filter(|reset_at| *reset_at >= cutoff)
         .collect::<Vec<_>>();
     keep_completed.sort_unstable_by(|left, right| right.cmp(left));
     keep_completed.truncate(retained_cycles);
-    let keep_completed = keep_completed.into_iter().collect::<BTreeSet<_>>();
+
+    // A window whose samples stop short of its end, or whose reset the
+    // provider later revised so the recorded one now sits in the future, fails
+    // `retention_cycle_descriptor` and used to be deleted outright — the
+    // history card then reported no history for a window that had been sampled
+    // for days. Measured on the store behind #370: two weekly groups of 51
+    // samples each, and a session group of 38 whose last reading landed at
+    // phase 0.796 against the 0.90 the coverage test wants.
+    let mut keep_records = retainable_groups(series, now)
+        .into_iter()
+        .filter(|(reset_at, samples)| {
+            !modelable.contains(reset_at)
+                && *reset_at >= cutoff
+                && group_holds_substance(samples)
+        })
+        .map(|(reset_at, _)| reset_at)
+        .collect::<Vec<_>>();
+    keep_records.sort_unstable_by(|left, right| right.cmp(left));
+    keep_records.truncate(RETENTION_RECORD_GROUPS);
+
+    let keep_completed = keep_completed
+        .into_iter()
+        .chain(keep_records)
+        .collect::<BTreeSet<_>>();
     let active_reset = series.active_reset_at;
     series.samples.retain(|sample| {
         let reset = normalize_reset(sample.reset_at, sample.duration_seconds);
@@ -2407,7 +2590,7 @@ fn evict_inactive_series(
     Ok(())
 }
 
-fn evict_old_completed_samples(store: &mut Store, now: i64) -> Result<(), HistoryError> {
+fn evict_old_completed_samples(store: &mut Store, _now: i64) -> Result<(), HistoryError> {
     let mut candidates = Vec::new();
     for series in &store.series {
         let active_reset = series.active_reset_at;
@@ -2419,14 +2602,19 @@ fn evict_old_completed_samples(store: &mut Store, now: i64) -> Result<(), Histor
             }) {
                 continue;
             }
-            if retention_cycle_descriptor(reset_at, &samples, now).is_some() {
-                candidates.push((
-                    reset_at,
-                    series.provider_id.clone(),
-                    series.account_scope.clone(),
-                    series.window_key.clone(),
-                ));
-            }
+            // Every non-active group is a candidate, matching what
+            // `retain_series` now keeps. Gating this on
+            // `retention_cycle_descriptor` was consistent only while retention
+            // deleted the groups that fail it: once they persist, a store can
+            // reach `MAX_SAMPLES` holding nothing this loop is willing to
+            // evict, and the `None` below turns a data-loss defect into a
+            // `StoreCapacity` write failure instead of fixing it.
+            candidates.push((
+                reset_at,
+                series.provider_id.clone(),
+                series.account_scope.clone(),
+                series.window_key.clone(),
+            ));
         }
     }
     candidates.sort();
@@ -3329,12 +3517,32 @@ fn with_locked_transaction_with_save_and_mode<T>(
             let result = body(&mut loaded.store);
             match result {
                 Ok(value) => {
-                    if !validate_store_at(&loaded.store, upper_bound) {
+                    // Repair before refusing. The body can leave a store the
+                    // validator rejects without the recorded sample being at
+                    // fault -- see `repair_invalid_series` -- and refusing here
+                    // writes nothing, so the same failure repeats on every
+                    // poll for ever while the card reports "history
+                    // unavailable" for every provider (#370). A bounded repair
+                    // that makes the store valid is worth a handful of samples;
+                    // an unbounded one is not, and above the bound this refuses
+                    // exactly as it did before.
+                    if !validate_store_at(&loaded.store, upper_bound)
+                        && repair_invalid_series(&mut loaded.store, upper_bound).is_none()
+                    {
                         Err(HistoryError::Serialize)
-                    } else if loaded.store == before {
+                    } else if loaded.store == before && !loaded.repaired {
                         Ok(value)
                     } else if save(path, &loaded.store).is_err() {
-                        Err(HistoryError::AtomicSave)
+                        // Writing back only the loader's repair is housekeeping:
+                        // the body's result does not depend on it, and the next
+                        // load repeats the repair in memory. Failing here would
+                        // turn a full disk into "history unavailable" for every
+                        // provider on every poll.
+                        if loaded.store == before {
+                            Ok(value)
+                        } else {
+                            Err(HistoryError::AtomicSave)
+                        }
                     } else {
                         Ok(value)
                     }
@@ -3353,11 +3561,6 @@ fn with_locked_transaction_with_save_and_mode<T>(
 }
 
 fn read_legacy_v2_with_mode(_mode: StorageMode, path: &Path) -> io::Result<Option<Vec<u8>>> {
-    #[cfg(target_os = "windows")]
-    if _mode.uses_windows_secure_storage() {
-        return read_owner_only_with_mode(_mode, path);
-    }
-
     match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -3400,9 +3603,10 @@ fn load_store(path: &Path, now: i64) -> Result<LoadedStore, HistoryError> {
 ///
 /// **The upgrade is lazy, and that is the chosen semantics.** The transaction
 /// snapshots `before` from the value this function returns and writes only when
-/// the store actually changed, so a bare version bump does not dirty it and
-/// does not trigger a write; `read_series_at_path_with_mode` never writes at
-/// all. The file therefore stays `"schemaVersion": 3` on disk until the next
+/// the store actually changed or `LoadedStore::repaired` is set, and a bare
+/// version bump sets neither, so it does not trigger a write;
+/// `read_series_at_path_with_mode` never writes at all. The file therefore
+/// stays `"schemaVersion": 3` on disk until the next
 /// transaction that had a reason to write anyway, re-upgrading in memory on
 /// every load until then. Chosen over an eager upgrade because writing is the
 /// only irreversible act here, and because a file still stamped 3 is one an
@@ -3441,6 +3645,7 @@ fn load_store_at_with_mode(
         return Ok(LoadedStore {
             store: Store::default(),
             quarantined: false,
+            repaired: false,
         });
     };
 
@@ -3469,16 +3674,21 @@ fn load_store_at_with_mode(
         // be able to add it retroactively.
         .map(migrate_store_to_current)
         .map(drop_unplaceable_samples)
-        .filter(|store| validate_store(store));
-    if let Some(store) = parsed {
-        let store = if validate_store_at(&store, validation_now) {
-            store
-        } else {
+        .filter(|(store, _)| validate_store(store));
+    if let Some((store, dropped)) = parsed {
+        // `repair_store_at` always changes a store that failed this check: the
+        // failure is some `last_activity_at` above the ceiling, and the repair
+        // drops the samples stamped past the ceiling and lowers the timestamp.
+        let clock_repaired = !validate_store_at(&store, validation_now);
+        let store = if clock_repaired {
             repair_store_at(store, validation_now, quarantine_now)
+        } else {
+            store
         };
         return Ok(LoadedStore {
             store,
             quarantined: false,
+            repaired: dropped || clock_repaired,
         });
     }
 
@@ -3487,44 +3697,11 @@ fn load_store_at_with_mode(
     Ok(LoadedStore {
         store: Store::default(),
         quarantined: true,
+        repaired: false,
     })
 }
 
 fn quarantine_corrupt_with_mode(_mode: StorageMode, path: &Path, now: i64) -> io::Result<PathBuf> {
-    #[cfg(target_os = "windows")]
-    if _mode.uses_windows_secure_storage() {
-        let directory = path.parent().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "missing quota pace history directory",
-            )
-        })?;
-        let directory_handle =
-            crate::agent_storage_windows::ensure_secure_storage_directory(directory)?;
-        for suffix in 0..=u32::MAX {
-            let name = if suffix == 0 {
-                format!("quota-pace-history-v3.corrupt-{now}.json")
-            } else {
-                format!("quota-pace-history-v3.corrupt-{now}.{suffix}.json")
-            };
-            let candidate = directory.join(name);
-            match crate::agent_storage_windows::quarantine_secure_file_candidate(
-                &directory_handle,
-                directory,
-                path,
-                &candidate,
-            ) {
-                Ok(()) => return Ok(candidate),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "unable to choose a quota pace quarantine name",
-        ));
-    }
-
     quarantine_corrupt(path, now)
 }
 
@@ -3597,15 +3774,6 @@ where
 fn save_store_atomic_with_mode(mode: StorageMode, path: &Path, store: &Store) -> io::Result<()> {
     #[cfg(test)]
     SAVE_CALL_COUNT.with(|count| count.set(count.get().saturating_add(1)));
-    #[cfg(target_os = "windows")]
-    if mode.uses_windows_secure_storage() {
-        return save_store_atomic_windows_secure_with_replace(
-            path,
-            store,
-            crate::agent_storage_windows::replace_secure_file,
-        );
-    }
-
     save_store_atomic_with_sync(
         path,
         store,
@@ -3622,54 +3790,6 @@ pub(crate) fn save_call_count() -> u64 {
 #[cfg(test)]
 pub(crate) fn reset_save_call_count() {
     SAVE_CALL_COUNT.with(|count| count.set(0));
-}
-
-#[cfg(target_os = "windows")]
-fn save_store_atomic_windows_secure_with_replace(
-    path: &Path,
-    store: &Store,
-    replace: impl FnOnce(&File, &Path, &Path, &Path) -> io::Result<()>,
-) -> io::Result<()> {
-    let directory = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "missing quota pace history directory",
-        )
-    })?;
-    let payload = serialize_store_canonical(store)?;
-    let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(HISTORY_FILE_NAME);
-    let temp_path = directory.join(format!(".{file_name}.tmp-{}-{counter}", std::process::id()));
-    let mut temp_created = false;
-
-    let result = (|| {
-        let directory_handle =
-            crate::agent_storage_windows::ensure_secure_storage_directory(directory)?;
-        let mut file = crate::agent_storage_windows::create_new_secure_file(&temp_path)?;
-        temp_created = true;
-        file.write_all(&payload)?;
-        file.flush()?;
-        file.sync_all()?;
-        drop(file);
-        replace(&directory_handle, directory, &temp_path, path)
-    })();
-    if result.is_err() && temp_created {
-        cleanup_windows_secure_history_temp(&temp_path);
-    }
-    result
-}
-
-#[cfg(target_os = "windows")]
-fn cleanup_windows_secure_history_temp(path: &Path) {
-    let Ok(file) = crate::agent_storage_windows::open_existing_secure_file(path, false) else {
-        return;
-    };
-    if crate::agent_storage_windows::verify_secure_file_path(&file, path).is_ok() {
-        let _ = fs::remove_file(path);
-    }
 }
 
 fn save_store_atomic_with<F>(path: &Path, store: &Store, replace: F) -> io::Result<()>
@@ -3736,12 +3856,6 @@ where
 }
 
 fn sync_directory_with_mode(_mode: StorageMode, directory: &Path) -> io::Result<()> {
-    #[cfg(target_os = "windows")]
-    if _mode.uses_windows_secure_storage() {
-        let directory = crate::agent_storage_windows::ensure_secure_storage_directory(directory)?;
-        return crate::agent_storage_windows::flush_secure_storage_directory(&directory);
-    }
-
     sync_directory(directory)
 }
 
@@ -3750,12 +3864,6 @@ fn sync_directory(directory: &Path) -> io::Result<()> {
 }
 
 fn ensure_real_directory_with_mode(_mode: StorageMode, directory: &Path) -> io::Result<()> {
-    #[cfg(target_os = "windows")]
-    if _mode.uses_windows_secure_storage() {
-        drop(crate::agent_storage_windows::ensure_secure_storage_directory(directory)?);
-        return Ok(());
-    }
-
     ensure_real_directory(directory)
 }
 
@@ -3794,12 +3902,6 @@ fn ensure_real_directory(directory: &Path) -> io::Result<()> {
 }
 
 fn open_history_lock(_mode: StorageMode, path: &Path) -> Result<File, HistoryError> {
-    #[cfg(target_os = "windows")]
-    if _mode.uses_windows_secure_storage() {
-        return crate::agent_storage_windows::open_secure_lock_file(path)
-            .map_err(|_| HistoryError::LockOpen);
-    }
-
     let file = open_owner_only(path).map_err(|_| HistoryError::LockOpen)?;
     file.lock_exclusive()
         .map_err(|_| HistoryError::LockAcquire)?;
@@ -3826,15 +3928,6 @@ fn open_owner_only(path: &Path) -> io::Result<File> {
 }
 
 fn open_existing_owner_only_with_mode(_mode: StorageMode, path: &Path) -> io::Result<Option<File>> {
-    #[cfg(target_os = "windows")]
-    if _mode.uses_windows_secure_storage() {
-        return match crate::agent_storage_windows::open_existing_secure_file(path, false) {
-            Ok(file) => Ok(Some(file)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
-        };
-    }
-
     open_existing_owner_only(path)
 }
 
@@ -3882,11 +3975,6 @@ fn verify_open_regular_file_with_mode(
     path: &Path,
     file: &File,
 ) -> io::Result<()> {
-    #[cfg(target_os = "windows")]
-    if _mode.uses_windows_secure_storage() {
-        return crate::agent_storage_windows::verify_secure_file_path(file, path);
-    }
-
     verify_open_regular_file(path, file)
 }
 
@@ -3938,6 +4026,455 @@ fn rollback_quarantine_link(path: &Path, source: &File) {
 }
 
 #[cfg(test)]
+mod recovery {
+    //! A one-off recovery lane for a store that was quarantined, run by hand.
+    //!
+    //! `#[ignore]`, so it never runs in CI, and it reads its paths from the
+    //! environment so no user path is compiled in. It exists because the first
+    //! attempt at this merge was validated by a REIMPLEMENTATION of the
+    //! engine's rules in another language, that copy was missing
+    //! `validate_store`'s "series must be sorted by key" clause, and the result
+    //! was a store the engine quarantined on sight — a history wiped by a
+    //! check that said it had passed.
+    //!
+    //! So nothing here restates a rule. The merge goes through
+    //! `add_sample_if_new`, which owns the sample key and the per-cycle cap;
+    //! the write goes through `save_store_atomic_with_mode`, which owns the
+    //! series ordering; and the verdict comes from `load_store`, which is the
+    //! same function the app calls. The only thing this file contributes is
+    //! deciding WHICH samples to offer.
+    use super::*;
+    use std::path::PathBuf;
+
+    fn path_from(var: &str) -> PathBuf {
+        PathBuf::from(std::env::var(var).unwrap_or_else(|_| panic!("{var} must be set")))
+    }
+
+    /// Build a series holding `count` samples that all collide on one
+    /// `sample_key`, which is what a duration change can leave behind: the
+    /// quantum comes from each sample's own `duration_seconds`, so a series
+    /// carrying both a contract duration and a learned one is bucketed two
+    /// ways and a set that was valid stops being valid.
+    fn series_with_colliding_samples(count: usize) -> SeriesState {
+        let reset = 1_789_933_140_i64;
+        let duration = 18_000_i64;
+        let mut series = SeriesState {
+            provider_id: "claude".to_string(),
+            account_scope: "scope".to_string(),
+            window_key: "session.v1".to_string(),
+            active_reset_at: None,
+            last_activity_at: reset,
+            rollover: None,
+            samples: Vec::new(),
+        };
+        for index in 0..count {
+            series.samples.push(QuotaSample {
+                reset_at: reset,
+                duration_seconds: duration,
+                duration_source: DurationSource::Observed,
+                used_percent: index as f64,
+                // The same phase bucket for every one of them, so each is a
+                // duplicate key rather than a new bucket.
+                sampled_at: reset - 10,
+                origin: SampleOrigin::LiveV3,
+                plan: None,
+            });
+        }
+        series
+    }
+
+    #[test]
+    fn repair_drops_the_duplicates_that_make_a_series_invalid() {
+        let mut store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![series_with_colliding_samples(3)],
+        };
+        let now = 1_789_933_200_i64;
+        // Control: the fixture really is invalid, or the repair below is
+        // reported as a success over a store that never needed one.
+        assert!(
+            !validate_store_at(&store, now),
+            "fixture must start invalid"
+        );
+
+        let dropped = repair_invalid_series(&mut store, now);
+
+        assert_eq!(dropped, Some(2), "two of the three collide and go");
+        assert!(
+            validate_store_at(&store, now),
+            "the repaired store must validate"
+        );
+        assert_eq!(store.series[0].samples.len(), 1);
+    }
+
+    #[test]
+    fn repair_refuses_rather_than_shredding_a_history() {
+        let over = MAX_REPAIR_DROPS_PER_TRANSACTION + 2;
+        let mut store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![series_with_colliding_samples(over + 1)],
+        };
+        let before = store.series[0].samples.len();
+        let now = 1_789_933_200_i64;
+        assert!(
+            !validate_store_at(&store, now),
+            "fixture must start invalid"
+        );
+
+        let dropped = repair_invalid_series(&mut store, now);
+
+        assert_eq!(dropped, None, "past the bound the repair must refuse");
+        assert_eq!(
+            store.series[0].samples.len(),
+            before,
+            "a refused repair must leave every sample where it was"
+        );
+    }
+
+    #[test]
+    fn the_allowance_scales_with_the_series_and_never_falls_below_the_floor() {
+        // A flat bound is what #370 shipped and what refused the real repair,
+        // so the scaling half needs an assertion of its own: without it,
+        // `MAX_REPAIR_DROP_PERCENT` could go to 0 and every test above would
+        // still pass.
+        assert_eq!(repair_drop_allowance(0), MAX_REPAIR_DROPS_PER_TRANSACTION);
+        assert_eq!(
+            repair_drop_allowance(100),
+            MAX_REPAIR_DROPS_PER_TRANSACTION,
+            "2% of 100 is under the floor, so the floor answers"
+        );
+        // The measured #370 series: 5815 samples needing 39 drops. 116 is the
+        // allowance it gets, which is why the repair now runs instead of
+        // leaving every provider's card dark.
+        assert_eq!(repair_drop_allowance(5815), 116);
+        assert!(repair_drop_allowance(5815) > 39);
+    }
+
+    #[test]
+    fn a_cap_rejected_sample_does_not_reserve_the_key_a_later_one_needs() {
+        // `sample_order` compares `reset_at` before `duration_seconds`, so a
+        // short sample can be processed ahead of a long one that shares its
+        // key. Reserving the key for the short one — which the cap then
+        // rejects — made the long one a duplicate of a sample nobody kept.
+        //
+        // R is a multiple of 900, so both `normalize_reset` quanta (180 for
+        // 18000s, 300 for 300000s) round every raw reset below to exactly R.
+        const R: i64 = 1_789_933_500;
+        const SHORT: i64 = 18_000; // quantum 180, cap 48
+        const LONG: i64 = 300_000; // quantum 300, cap 192
+
+        let sample = |raw_reset: i64, duration: i64, sampled_at: i64, used: f64| QuotaSample {
+            reset_at: raw_reset,
+            duration_seconds: duration,
+            duration_source: DurationSource::Observed,
+            used_percent: used,
+            sampled_at,
+            origin: SampleOrigin::LiveV3,
+            plan: None,
+        };
+
+        let mut samples = Vec::new();
+        // Buckets 48..=95 of the long window, filling the reset group to 48 —
+        // the short cap — without touching any bucket a short sample can take.
+        for bucket in 48..96i64 {
+            samples.push(sample(
+                R - 100,
+                LONG,
+                R - 300_000 + 1562 * bucket + 781,
+                bucket as f64,
+            ));
+        }
+        // Bucket 0, short: a unique key, but the group already holds 48.
+        samples.push(sample(R - 50, SHORT, R - 17_800, 99.0));
+        // Bucket 0, long: the same key, and 49 is well inside its own cap.
+        samples.push(sample(R - 20, LONG, R - 299_000, 98.0));
+
+        let mut store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![SeriesState {
+                provider_id: "claude".to_string(),
+                account_scope: "scope".to_string(),
+                window_key: "session.v1".to_string(),
+                active_reset_at: None,
+                last_activity_at: R,
+                rollover: None,
+                samples,
+            }],
+        };
+        let now = R + 60;
+
+        // Controls: the fixture is invalid for the reason claimed, and the two
+        // bucket-0 samples really do collide, or the assertion below passes on
+        // a fixture that never exercised the path.
+        assert!(!validate_store_at(&store, now), "fixture must start invalid");
+        let short = sample(R - 50, SHORT, R - 17_800, 99.0);
+        let long = sample(R - 20, LONG, R - 299_000, 98.0);
+        assert_eq!(
+            sample_key(&short),
+            sample_key(&long),
+            "the fixture's two bucket-0 samples must share a key"
+        );
+        assert!(
+            phase_bucket_count(LONG) > phase_bucket_count(SHORT),
+            "the later sample must have the larger cap"
+        );
+
+        let dropped = repair_invalid_series(&mut store, now);
+
+        assert_eq!(
+            dropped,
+            Some(1),
+            "only the cap-rejected short sample goes; reserving its key cost a second drop"
+        );
+        assert_eq!(store.series[0].samples.len(), 49);
+        assert!(
+            store.series[0]
+                .samples
+                .iter()
+                .any(|kept| kept.used_percent == 98.0),
+            "the long bucket-0 sample is under its own cap and must survive"
+        );
+    }
+
+    #[test]
+    fn repair_keeps_the_oldest_reading_of_a_colliding_pair() {
+        let mut store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![series_with_colliding_samples(2)],
+        };
+        // `used_percent` doubles as an identity here: the fixture numbers them
+        // 0, 1, ... in insertion order and `sample_order` sorts oldest first,
+        // so keeping index 0 is keeping the reading stored longest.
+        let now = 1_789_933_200_i64;
+        assert_eq!(repair_invalid_series(&mut store, now), Some(1));
+        assert_eq!(store.series[0].samples[0].used_percent, 0.0);
+    }
+
+    /// Drop the samples that make a stored series fail `validate_series`,
+    /// keeping everything else.
+    ///
+    /// A store can hold a duplicate `sample_key`, or a cycle carrying more
+    /// samples than its phase buckets allow, and still load — `load_store`
+    /// repairs what it can. What it cannot do is make the next WRITE succeed:
+    /// `with_locked_transaction_with_save_and_mode` validates after the body
+    /// runs, the series is still invalid, and the whole transaction returns
+    /// `HistoryError::Serialize`. The caller then reports every window in the
+    /// batch as `unavailable("history")`, so one old sample silently disables
+    /// pace for every provider, indefinitely, with nothing written and nothing
+    /// quarantined to show for it.
+    ///
+    /// Every rule here is the engine's. `sample_key`, `phase_bucket_count` and
+    /// `validate_series` decide what goes; `save_store_atomic_with_mode`
+    /// orders and writes; `load_store` gives the verdict. This lane only
+    /// chooses the ORDER samples are offered in — oldest first, so the reading
+    /// that has been in the store longest is the one kept.
+    /// Report, for a real store, which sample groups `retain_series` keeps and
+    /// which it drops.
+    ///
+    /// A fixture can prove the rule; only a store that actually lost data can
+    /// prove the rule reaches it. This runs the engine's own `retain_series`
+    /// and prints each group's reset, size and verdict, so the groups #370
+    /// erased can be checked against the version of the code that is meant to
+    /// keep them. It writes nothing.
+    #[test]
+    #[ignore = "run by hand with RETAIN_IN"]
+    fn report_which_groups_retention_keeps() {
+        let in_path = path_from("RETAIN_IN");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let raw = std::fs::read_to_string(&in_path).expect("read store");
+        let store: Store = serde_json::from_str(&raw).expect("parse store");
+
+        for series in &store.series {
+            let before = grouped_samples(&series.samples)
+                .into_iter()
+                .map(|(reset_at, samples)| (reset_at, samples.len()))
+                .collect::<Vec<_>>();
+            let mut copy = series.clone();
+            retain_series(&mut copy, now);
+            let after = grouped_samples(&copy.samples)
+                .into_iter()
+                .map(|(reset_at, samples)| (reset_at, samples.len()))
+                .collect::<BTreeMap<_, _>>();
+            for (reset_at, size) in before {
+                if after.get(&reset_at).copied() != Some(size) {
+                    eprintln!(
+                        "[RETAIN] {}/{} reset={reset_at} {size} -> {:?}",
+                        series.provider_id,
+                        series.window_key,
+                        after.get(&reset_at).copied().unwrap_or(0)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "run by hand with REPAIR_IN / REPAIR_OUT"]
+    fn drop_samples_that_make_a_series_invalid() {
+        let in_path = path_from("REPAIR_IN");
+        let out_path = path_from("REPAIR_OUT");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let raw = std::fs::read_to_string(&in_path).expect("read store");
+        let mut store: Store = serde_json::from_str(&raw).expect("parse store");
+        let before: usize = store.series.iter().map(|s| s.samples.len()).sum();
+
+        let mut dropped_dup = 0usize;
+        let mut dropped_cap = 0usize;
+        for series in &mut store.series {
+            let mut ordered = series.samples.clone();
+            ordered.sort_by(sample_order);
+            let mut keys: BTreeSet<(i64, usize)> = BTreeSet::new();
+            let mut counts: BTreeMap<i64, usize> = BTreeMap::new();
+            let mut kept: Vec<QuotaSample> = Vec::with_capacity(ordered.len());
+            for sample in ordered {
+                if !keys.insert(sample_key(&sample)) {
+                    dropped_dup += 1;
+                    continue;
+                }
+                let reset = normalize_reset(sample.reset_at, sample.duration_seconds);
+                let cap = phase_bucket_count(sample.duration_seconds);
+                let count = counts.entry(reset).or_default();
+                if *count + 1 > cap {
+                    dropped_cap += 1;
+                    continue;
+                }
+                *count += 1;
+                kept.push(sample);
+            }
+            series.samples = kept;
+            if let Some(newest) = series.samples.iter().map(|s| s.sampled_at).max() {
+                series.last_activity_at = series.last_activity_at.max(newest);
+            }
+        }
+
+        save_store_atomic_with_mode(StorageMode::Generic, &out_path, &store).expect("save");
+        let loaded = load_store(&out_path, now).expect("load back");
+        let after: usize = loaded.store.series.iter().map(|s| s.samples.len()).sum();
+        let still_invalid = loaded
+            .store
+            .series
+            .iter()
+            .filter(|s| !validate_series(s))
+            .count();
+
+        eprintln!(
+            "repaired: samples {before} -> {after} (dropped dup {dropped_dup}, over-cap {dropped_cap}), \
+             series still invalid {still_invalid}"
+        );
+        assert!(
+            !loaded.quarantined,
+            "the engine quarantined the repaired store"
+        );
+        assert_eq!(
+            still_invalid, 0,
+            "a series is still invalid after the repair"
+        );
+        assert!(
+            validate_store_at(&loaded.store, now),
+            "the repaired store still fails the check that blocks every write"
+        );
+    }
+
+    #[test]
+    #[ignore = "run by hand with RECOVER_LIVE / RECOVER_QUARANTINE / RECOVER_OUT"]
+    fn merge_quarantined_history_and_prove_the_engine_accepts_it() {
+        let live_path = path_from("RECOVER_LIVE");
+        let quarantine_path = path_from("RECOVER_QUARANTINE");
+        let out_path = path_from("RECOVER_OUT");
+        let now = std::env::var("RECOVER_NOW")
+            .ok()
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64
+            });
+
+        let live_raw = std::fs::read_to_string(&live_path).expect("read live");
+        let quarantine_raw = std::fs::read_to_string(&quarantine_path).expect("read quarantine");
+        let mut live: Store = serde_json::from_str(&live_raw).expect("parse live");
+        let quarantined: Store =
+            serde_json::from_str(&quarantine_raw).expect("parse quarantined");
+        let before = live.series.iter().map(|s| s.samples.len()).sum::<usize>();
+
+        let mut added = 0usize;
+        let mut refused = 0usize;
+        for source in &quarantined.series {
+            let key = SeriesKey::from_stored_parts(
+                &source.provider_id,
+                &source.account_scope,
+                &source.window_key,
+            );
+            let index = match live.series.iter().position(|s| s.key() == key) {
+                Some(i) => i,
+                None => {
+                    live.series.push(SeriesState::new(&key, now));
+                    live.series.len() - 1
+                }
+            };
+            let target = &mut live.series[index];
+            let mut ordered = source.samples.clone();
+            ordered.sort_by(sample_order);
+            for sample in ordered {
+                // `add_sample_if_new` owns every admission rule. A false here
+                // is the engine refusing, not this lane deciding.
+                if add_sample_if_new(
+                    target,
+                    sample.reset_at,
+                    sample.duration_seconds,
+                    sample.duration_source,
+                    sample.used_percent,
+                    sample.sampled_at,
+                ) {
+                    added += 1;
+                    // `validate_series` requires `last_activity_at` to be at
+                    // or after every sample's `sampled_at`, and
+                    // `add_sample_if_new` only touches `samples`. Appending
+                    // without this leaves a store the loader quarantines --
+                    // the outcome this lane exists to avoid. It did not fire
+                    // on the store it was written for, because every merged
+                    // sample predated the live series' activity, which is the
+                    // kind of luck that hides a defect rather than removing
+                    // it.
+                    target.last_activity_at =
+                        target.last_activity_at.max(sample.sampled_at);
+                } else {
+                    refused += 1;
+                }
+            }
+        }
+
+        save_store_atomic_with_mode(StorageMode::Generic, &out_path, &live).expect("save");
+        let loaded = load_store(&out_path, now).expect("load back");
+        let after = loaded
+            .store
+            .series
+            .iter()
+            .map(|s| s.samples.len())
+            .sum::<usize>();
+
+        eprintln!(
+            "merged: series {} -> {}, samples {before} -> {after} (offered-added {added}, refused {refused})",
+            quarantined.series.len(),
+            loaded.store.series.len()
+        );
+        assert!(
+            !loaded.quarantined,
+            "the engine quarantined the merged store; it is NOT safe to install"
+        );
+        assert!(after >= before, "the merge must not lose samples");
+    }
+}
+
+#[cfg(test)]
 mod tests {
 
     /// Mechanical bridge for fixtures that only need a distinct scope identity.
@@ -3954,67 +4491,10 @@ mod tests {
     }
     use super::*;
     use chrono::Utc;
-    #[cfg(target_os = "windows")]
-    use std::ffi::OsStr;
-    #[cfg(target_os = "windows")]
-    use std::mem::size_of;
-    #[cfg(target_os = "windows")]
-    use std::os::windows::fs::{symlink_file, OpenOptionsExt as _};
-    #[cfg(target_os = "windows")]
-    use std::os::windows::io::AsRawHandle as _;
-    #[cfg(target_os = "windows")]
-    use std::process::{Child, Command, Stdio};
-    #[cfg(target_os = "windows")]
-    use std::ptr::{null, null_mut};
-    #[cfg(target_os = "windows")]
-    use std::time::{Duration, Instant};
     use std::time::{SystemTime, UNIX_EPOCH};
-    #[cfg(target_os = "windows")]
-    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
-    #[cfg(target_os = "windows")]
-    use windows_sys::Win32::Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT};
-    #[cfg(target_os = "windows")]
-    use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    };
-    #[cfg(target_os = "windows")]
-    use windows_sys::Win32::Storage::FileSystem::{
-        FileIdInfo, GetFileInformationByHandleEx, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, READ_CONTROL, WRITE_DAC,
-    };
 
     const HOUR: i64 = 3_600;
     const DAY: i64 = 86_400;
-
-    #[cfg(target_os = "windows")]
-    const CROSS_PROCESS_WORKER_TEST: &str =
-        "agent_quota_history::tests::windows_secure_cross_process_worker";
-    #[cfg(target_os = "windows")]
-    const CROSS_PROCESS_V3_ENV: &str = "TB_TOKENBAR_TEST_QUOTA_HISTORY_V3_PATH";
-    #[cfg(target_os = "windows")]
-    const CROSS_PROCESS_ACCOUNT_ENV: &str = "TB_TOKENBAR_TEST_QUOTA_HISTORY_ACCOUNT";
-    #[cfg(target_os = "windows")]
-    const CROSS_PROCESS_USED_ENV: &str = "TB_TOKENBAR_TEST_QUOTA_HISTORY_USED";
-    #[cfg(target_os = "windows")]
-    const CROSS_PROCESS_READY_ENV: &str = "TB_TOKENBAR_TEST_QUOTA_HISTORY_READY_PATH";
-    #[cfg(target_os = "windows")]
-    const CROSS_PROCESS_START_ENV: &str = "TB_TOKENBAR_TEST_QUOTA_HISTORY_START_PATH";
-    #[cfg(target_os = "windows")]
-    const CROSS_PROCESS_NOW_ENV: &str = "TB_TOKENBAR_TEST_QUOTA_HISTORY_NOW";
-    #[cfg(target_os = "windows")]
-    const CROSS_PROCESS_RESET_ENV: &str = "TB_TOKENBAR_TEST_QUOTA_HISTORY_RESET_AT";
-    #[cfg(target_os = "windows")]
-    const CROSS_PROCESS_START_FILE: &str = "tokenbar-test-quota-history-start.marker";
-
-    #[cfg(target_os = "windows")]
-    struct WindowsSecureTempCleanup(PathBuf);
-
-    #[cfg(target_os = "windows")]
-    impl Drop for WindowsSecureTempCleanup {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
 
     fn key(account: &str) -> SeriesKey {
         test_key("copilot", account, "premium_interactions.v1")
@@ -4032,266 +4512,6 @@ mod tests {
         ));
         fs::create_dir_all(&directory).unwrap();
         (directory.clone(), directory.join(HISTORY_FILE_NAME))
-    }
-
-    #[cfg(target_os = "windows")]
-    fn windows_secure_temp_path(label: &str) -> (PathBuf, PathBuf) {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "tokenbar-quota-v3-windows-secure-{}-{}-{label}",
-            std::process::id(),
-            nonce
-        ));
-        let handle = crate::agent_storage_windows::ensure_secure_storage_directory(&directory)
-            .expect("create exact secure history directory");
-        crate::agent_storage_windows::verify_storage_handle(handle.as_raw_handle() as HANDLE)
-            .expect("history directory DACL is exact");
-        drop(handle);
-        (directory.clone(), directory.join(HISTORY_FILE_NAME))
-    }
-
-    #[cfg(target_os = "windows")]
-    fn write_windows_secure_file(path: &Path, bytes: &[u8]) {
-        let mut file = crate::agent_storage_windows::create_new_secure_file(path)
-            .expect("create exact secure history fixture");
-        file.write_all(bytes).expect("write secure history fixture");
-        file.flush().expect("flush secure history fixture");
-        file.sync_all().expect("sync secure history fixture");
-        crate::agent_storage_windows::verify_storage_handle(file.as_raw_handle() as HANDLE)
-            .expect("fixture DACL is exact");
-        crate::agent_storage_windows::verify_secure_file_path(&file, path)
-            .expect("fixture path identity is exact");
-    }
-
-    #[cfg(target_os = "windows")]
-    fn windows_secure_file_snapshot(path: &Path) -> (Vec<u8>, u64, [u8; 16]) {
-        let mut file = crate::agent_storage_windows::open_existing_secure_file(path, false)
-            .expect("open exact secure history fixture");
-        crate::agent_storage_windows::verify_storage_handle(file.as_raw_handle() as HANDLE)
-            .expect("secure file DACL is exact");
-        crate::agent_storage_windows::verify_secure_file_path(&file, path)
-            .expect("secure file path identity is exact");
-        let mut identity = FILE_ID_INFO::default();
-        assert_ne!(
-            unsafe {
-                GetFileInformationByHandleEx(
-                    file.as_raw_handle() as HANDLE,
-                    FileIdInfo,
-                    (&mut identity as *mut FILE_ID_INFO).cast(),
-                    size_of::<FILE_ID_INFO>() as u32,
-                )
-            },
-            0
-        );
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).expect("read secure fixture");
-        crate::agent_storage_windows::verify_secure_file_path(&file, path)
-            .expect("secure file identity is stable after read");
-        (
-            bytes,
-            identity.VolumeSerialNumber,
-            identity.FileId.Identifier,
-        )
-    }
-
-    #[cfg(target_os = "windows")]
-    fn windows_file_identity(path: &Path) -> (u64, [u8; 16]) {
-        let file = OpenOptions::new()
-            .read(true)
-            .open(path)
-            .expect("open Windows file identity fixture");
-        let mut identity = FILE_ID_INFO::default();
-        assert_ne!(
-            unsafe {
-                GetFileInformationByHandleEx(
-                    file.as_raw_handle() as HANDLE,
-                    FileIdInfo,
-                    (&mut identity as *mut FILE_ID_INFO).cast(),
-                    size_of::<FILE_ID_INFO>() as u32,
-                )
-            },
-            0
-        );
-        (identity.VolumeSerialNumber, identity.FileId.Identifier)
-    }
-
-    #[cfg(target_os = "windows")]
-    fn make_windows_path_permissive(path: &Path, is_directory: bool) {
-        let mut options = OpenOptions::new();
-        options.access_mode(READ_CONTROL | WRITE_DAC);
-        if is_directory {
-            options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-        }
-        let file = options
-            .open(path)
-            .expect("open fixture security descriptor");
-        let status = unsafe {
-            SetSecurityInfo(
-                file.as_raw_handle() as HANDLE,
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                null_mut(),
-                null_mut(),
-                null(),
-                null(),
-            )
-        };
-        assert_eq!(status, ERROR_SUCCESS);
-    }
-
-    #[cfg(target_os = "windows")]
-    fn assert_no_windows_secure_temp(directory: &Path) {
-        let prefix = format!(".{HISTORY_FILE_NAME}.tmp-");
-        assert!(!fs::read_dir(directory).unwrap().any(|entry| {
-            entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(&prefix)
-        }));
-    }
-
-    #[cfg(target_os = "windows")]
-    fn assert_no_windows_corrupt_candidate(directory: &Path) {
-        assert!(!fs::read_dir(directory).unwrap().any(|entry| {
-            entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with("quota-pace-history-v3.corrupt-")
-        }));
-    }
-
-    #[cfg(target_os = "windows")]
-    fn create_windows_secure_marker(path: &Path) -> io::Result<()> {
-        let file = crate::agent_storage_windows::create_new_secure_file(path)?;
-        file.sync_all()?;
-        crate::agent_storage_windows::verify_storage_handle(file.as_raw_handle() as HANDLE)?;
-        crate::agent_storage_windows::verify_secure_file_path(&file, path)?;
-        Ok(())
-    }
-
-    #[cfg(target_os = "windows")]
-    fn windows_secure_marker_exists(path: &Path) -> io::Result<bool> {
-        let file = match crate::agent_storage_windows::open_existing_secure_file(path, false) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        crate::agent_storage_windows::verify_storage_handle(file.as_raw_handle() as HANDLE)?;
-        crate::agent_storage_windows::verify_secure_file_path(&file, path)?;
-        Ok(true)
-    }
-
-    #[cfg(target_os = "windows")]
-    fn validate_cross_process_child_paths(path: &Path, ready: &Path, start: &Path) {
-        let directory = path.parent().expect("cross-process v3 path has a parent");
-        let temp = std::env::temp_dir();
-        assert!(path.is_absolute());
-        assert_eq!(directory.parent(), Some(temp.as_path()));
-        assert!(directory
-            .file_name()
-            .and_then(OsStr::to_str)
-            .is_some_and(|name| name.starts_with("tokenbar-quota-v3-windows-secure-")));
-        assert_eq!(path.file_name(), Some(OsStr::new(HISTORY_FILE_NAME)));
-        assert_eq!(ready.parent(), Some(directory));
-        assert_eq!(start.parent(), Some(directory));
-        assert!(matches!(
-            ready.file_name().and_then(OsStr::to_str),
-            Some(
-                "tokenbar-test-quota-history-ready-a.marker"
-                    | "tokenbar-test-quota-history-ready-b.marker"
-            )
-        ));
-        assert_eq!(
-            start.file_name(),
-            Some(OsStr::new(CROSS_PROCESS_START_FILE))
-        );
-        assert_ne!(ready, start);
-        assert_ne!(ready, path);
-        assert_ne!(start, path);
-    }
-
-    #[cfg(target_os = "windows")]
-    fn spawn_windows_cross_process_worker(
-        path: &Path,
-        account: &str,
-        used_percent: f64,
-        ready: &Path,
-        start: &Path,
-        now: i64,
-        reset_at: i64,
-    ) -> io::Result<Child> {
-        Command::new(std::env::current_exe()?)
-            .arg(CROSS_PROCESS_WORKER_TEST)
-            .arg("--exact")
-            .arg("--test-threads=1")
-            .env(CROSS_PROCESS_V3_ENV, path)
-            .env(CROSS_PROCESS_ACCOUNT_ENV, account)
-            .env(CROSS_PROCESS_USED_ENV, used_percent.to_string())
-            .env(CROSS_PROCESS_READY_ENV, ready)
-            .env(CROSS_PROCESS_START_ENV, start)
-            .env(CROSS_PROCESS_NOW_ENV, now.to_string())
-            .env(CROSS_PROCESS_RESET_ENV, reset_at.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-    }
-
-    #[cfg(target_os = "windows")]
-    fn finish_windows_test_children(
-        children: Vec<Child>,
-        terminate_running: bool,
-    ) -> (bool, String) {
-        let mut all_success = true;
-        let mut diagnostics = String::new();
-        for (index, mut child) in children.into_iter().enumerate() {
-            if terminate_running {
-                let running = match child.try_wait() {
-                    Ok(status) => status.is_none(),
-                    Err(error) => {
-                        all_success = false;
-                        diagnostics.push_str(&format!(
-                            "child {index} try_wait before termination failed: {error}\n"
-                        ));
-                        true
-                    }
-                };
-                if running {
-                    if let Err(error) = child.kill() {
-                        all_success = false;
-                        diagnostics
-                            .push_str(&format!("child {index} termination failed: {error}\n"));
-                    }
-                }
-            }
-            match child.wait_with_output() {
-                Ok(output) => {
-                    all_success &= output.status.success();
-                    diagnostics.push_str(&format!(
-                        "child {index} status={}\nstdout:\n{}\nstderr:\n{}\n",
-                        output.status,
-                        String::from_utf8_lossy(&output.stdout),
-                        String::from_utf8_lossy(&output.stderr)
-                    ));
-                }
-                Err(error) => {
-                    all_success = false;
-                    diagnostics.push_str(&format!("child {index} wait failed: {error}\n"));
-                }
-            }
-        }
-        (all_success, diagnostics)
-    }
-
-    #[cfg(target_os = "windows")]
-    fn fail_windows_cross_process(children: Vec<Child>, reason: impl AsRef<str>) -> ! {
-        let (_, diagnostics) = finish_windows_test_children(children, true);
-        panic!("{}\n{}", reason.as_ref(), diagnostics);
     }
 
     #[cfg(unix)]
@@ -4485,1060 +4705,6 @@ mod tests {
             }),
             samples,
         }
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_secure_cross_process_worker() {
-        let Some(path) = std::env::var_os(CROSS_PROCESS_V3_ENV).map(PathBuf::from) else {
-            return;
-        };
-        let account = std::env::var(CROSS_PROCESS_ACCOUNT_ENV)
-            .expect("cross-process worker account is present");
-        let used_percent = std::env::var(CROSS_PROCESS_USED_ENV)
-            .expect("cross-process worker usage is present")
-            .parse::<f64>()
-            .expect("cross-process worker usage is numeric");
-        let ready = PathBuf::from(
-            std::env::var_os(CROSS_PROCESS_READY_ENV)
-                .expect("cross-process worker ready path is present"),
-        );
-        let start = PathBuf::from(
-            std::env::var_os(CROSS_PROCESS_START_ENV)
-                .expect("cross-process worker start path is present"),
-        );
-        let now = std::env::var(CROSS_PROCESS_NOW_ENV)
-            .expect("cross-process worker now is present")
-            .parse::<i64>()
-            .expect("cross-process worker now is numeric");
-        let reset_at = std::env::var(CROSS_PROCESS_RESET_ENV)
-            .expect("cross-process worker reset is present")
-            .parse::<i64>()
-            .expect("cross-process worker reset is numeric");
-
-        assert!(account.starts_with("tokenbar-test-cross-process-"));
-        assert!(used_percent.is_finite() && (0.0 < used_percent && used_percent <= 100.0));
-        assert_eq!(reset_at.checked_sub(now), Some(DAY));
-        validate_cross_process_child_paths(&path, &ready, &start);
-        create_windows_secure_marker(&ready).expect("create exact secure ready marker");
-
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            match windows_secure_marker_exists(&start) {
-                Ok(true) => break,
-                Ok(false) => {}
-                Err(error) => panic!("secure start marker verification failed: {error}"),
-            }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for secure start marker"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        assert!(matches!(
-            record_observation_at_path_and_evaluate_with_clock_and_mode(
-                key(&account),
-                Some(reset_at),
-                used_percent,
-                now,
-                provider(reset_at, DAY),
-                None,
-                &path,
-                StorageMode::System,
-                || now,
-            ),
-            Ok((HistoryOutcome::Ready { sampled: true, .. }, None))
-        ));
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_secure_cross_process_lock_preserves_both_samples() {
-        let (directory, path) = windows_secure_temp_path("cross-process-lock");
-        let cleanup = WindowsSecureTempCleanup(directory.clone());
-        let ready_paths = [
-            directory.join("tokenbar-test-quota-history-ready-a.marker"),
-            directory.join("tokenbar-test-quota-history-ready-b.marker"),
-        ];
-        let start_path = directory.join(CROSS_PROCESS_START_FILE);
-        let workers = [
-            ("tokenbar-test-cross-process-a", 17.0),
-            ("tokenbar-test-cross-process-b", 43.0),
-        ];
-        let now = 12_000_000_000_i64;
-        let reset_at = now + DAY;
-        let mut children = Vec::with_capacity(workers.len());
-        for ((account, used_percent), ready) in workers.iter().zip(&ready_paths) {
-            match spawn_windows_cross_process_worker(
-                &path,
-                account,
-                *used_percent,
-                ready,
-                &start_path,
-                now,
-                reset_at,
-            ) {
-                Ok(child) => children.push(child),
-                Err(error) => fail_windows_cross_process(
-                    children,
-                    format!("spawn cross-process secure history worker failed: {error}"),
-                ),
-            }
-        }
-
-        let ready_deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let mut all_ready = true;
-            for ready in &ready_paths {
-                match windows_secure_marker_exists(ready) {
-                    Ok(true) => {}
-                    Ok(false) => all_ready = false,
-                    Err(error) => fail_windows_cross_process(
-                        children,
-                        format!("secure ready marker verification failed: {error}"),
-                    ),
-                }
-            }
-            if all_ready {
-                break;
-            }
-
-            let mut early_exit = None;
-            for (index, child) in children.iter_mut().enumerate() {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        early_exit = Some(format!(
-                            "child {index} exited before both secure ready markers: {status}"
-                        ));
-                        break;
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        early_exit = Some(format!("child {index} try_wait failed: {error}"));
-                        break;
-                    }
-                }
-            }
-            if let Some(reason) = early_exit {
-                fail_windows_cross_process(children, reason);
-            }
-            if Instant::now() >= ready_deadline {
-                fail_windows_cross_process(children, "timed out waiting for secure ready markers");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        if let Err(error) = create_windows_secure_marker(&start_path) {
-            fail_windows_cross_process(
-                children,
-                format!("create exact secure start marker failed: {error}"),
-            );
-        }
-
-        let exit_deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let mut all_exited = true;
-            let mut child_failure = None;
-            for (index, child) in children.iter_mut().enumerate() {
-                match child.try_wait() {
-                    Ok(Some(status)) if status.success() => {}
-                    Ok(Some(status)) => {
-                        child_failure = Some(format!("child {index} failed: {status}"));
-                        break;
-                    }
-                    Ok(None) => all_exited = false,
-                    Err(error) => {
-                        child_failure = Some(format!("child {index} try_wait failed: {error}"));
-                        break;
-                    }
-                }
-            }
-            if let Some(reason) = child_failure {
-                fail_windows_cross_process(children, reason);
-            }
-            if all_exited {
-                break;
-            }
-            if Instant::now() >= exit_deadline {
-                fail_windows_cross_process(children, "timed out waiting for history workers");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        let (all_success, diagnostics) = finish_windows_test_children(children, false);
-        assert!(all_success, "cross-process workers failed:\n{diagnostics}");
-
-        let final_snapshot = windows_secure_file_snapshot(&path);
-        assert_eq!(final_snapshot, windows_secure_file_snapshot(&path));
-        let store = serde_json::from_slice::<Store>(&final_snapshot.0).unwrap();
-        assert!(validate_store_at(&store, now));
-        assert_eq!(store.series.len(), 2);
-        for (account, used_percent) in workers {
-            let expected_key = key(account);
-            let series = store
-                .series
-                .iter()
-                .find(|series| series.key() == expected_key)
-                .unwrap();
-            assert_eq!(series.samples.len(), 1);
-            let sample = &series.samples[0];
-            assert_eq!(sample.origin, SampleOrigin::LiveV3);
-            assert_eq!(sample.used_percent, used_percent);
-            assert_eq!(sample.sampled_at, now);
-            assert_eq!(sample.reset_at, reset_at);
-        }
-        assert_no_windows_secure_temp(&directory);
-        assert_no_windows_corrupt_candidate(&directory);
-        let lock_path = directory.join(HISTORY_LOCK_FILE_NAME);
-        let lock = windows_secure_file_snapshot(&lock_path);
-        assert!(lock.0.is_empty());
-        assert_eq!(lock, windows_secure_file_snapshot(&lock_path));
-
-        drop(cleanup);
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_secure_active_series_capacity_fails_closed_without_replacement() {
-        let (directory, path) = windows_secure_temp_path("capacity-fail-closed");
-        let cleanup = WindowsSecureTempCleanup(directory.clone());
-        let now = 12_100_000_200_i64;
-        let reset_at = now + DAY;
-        let mut store = Store {
-            schema_version: HISTORY_SCHEMA_VERSION,
-            series: (0..MAX_SERIES)
-                .map(|index| {
-                    rollover_only_series(
-                        key(&format!("secure-capacity-active-{index:04}")),
-                        now,
-                        reset_at,
-                        false,
-                    )
-                })
-                .collect(),
-        };
-        store.series.sort_by(series_order);
-        assert!(validate_store_at(&store, now));
-        write_windows_secure_file(&path, &serialize_store_canonical(&store).unwrap());
-        let before = windows_secure_file_snapshot(&path);
-
-        assert_eq!(
-            record_observation_at_path_and_evaluate_with_clock_and_mode(
-                key("secure-capacity-new"),
-                Some(reset_at),
-                25.0,
-                now,
-                provider(reset_at, DAY),
-                None,
-                &path,
-                StorageMode::System,
-                || now,
-            ),
-            Err(HistoryError::StoreCapacity)
-        );
-
-        let after = windows_secure_file_snapshot(&path);
-        assert_eq!(after, before);
-        let decoded = serde_json::from_slice::<Store>(&after.0).unwrap();
-        assert!(validate_store_at(&decoded, now));
-        assert_eq!(decoded.series.len(), MAX_SERIES);
-        assert!(!decoded
-            .series
-            .iter()
-            .any(|series| series.key() == key("secure-capacity-new")));
-        assert_no_windows_secure_temp(&directory);
-        assert_no_windows_corrupt_candidate(&directory);
-        let lock_path = directory.join(HISTORY_LOCK_FILE_NAME);
-        let lock = windows_secure_file_snapshot(&lock_path);
-        assert!(lock.0.is_empty());
-        assert_eq!(lock, windows_secure_file_snapshot(&lock_path));
-
-        drop(cleanup);
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_secure_stale_rollover_eviction_admits_new_series_atomically() {
-        let (directory, path) = windows_secure_temp_path("retention-admission");
-        let cleanup = WindowsSecureTempCleanup(directory.clone());
-        let now = 12_200_000_100_i64;
-        let reset_at = now + DAY;
-        let stale_key = key("secure-retention-stale");
-        let new_key = key("secure-retention-new");
-        let mut series = vec![rollover_only_series(
-            stale_key.clone(),
-            now - 57 * DAY,
-            now + 90 * DAY,
-            false,
-        )];
-        series.extend((0..MAX_SERIES - 1).map(|index| {
-            rollover_only_series(
-                key(&format!("secure-retention-active-{index:04}")),
-                now,
-                reset_at,
-                false,
-            )
-        }));
-        let mut store = Store {
-            schema_version: HISTORY_SCHEMA_VERSION,
-            series,
-        };
-        store.series.sort_by(series_order);
-        assert!(validate_store_at(&store, now));
-        write_windows_secure_file(&path, &serialize_store_canonical(&store).unwrap());
-        let before = windows_secure_file_snapshot(&path);
-
-        assert!(matches!(
-            record_observation_at_path_and_evaluate_with_clock_and_mode(
-                new_key.clone(),
-                Some(reset_at),
-                35.0,
-                now,
-                provider(reset_at, DAY),
-                None,
-                &path,
-                StorageMode::System,
-                || now,
-            ),
-            Ok((HistoryOutcome::Ready { sampled: true, .. }, None))
-        ));
-
-        let after = windows_secure_file_snapshot(&path);
-        assert_ne!(after.0, before.0);
-        assert_ne!((after.1, after.2), (before.1, before.2));
-        assert_eq!(after, windows_secure_file_snapshot(&path));
-        let retained = serde_json::from_slice::<Store>(&after.0).unwrap();
-        assert!(validate_store_at(&retained, now));
-        assert_eq!(retained.series.len(), MAX_SERIES);
-        assert!(!retained
-            .series
-            .iter()
-            .any(|series| series.key() == stale_key));
-        assert_eq!(
-            retained
-                .series
-                .iter()
-                .filter(|series| { series.account_scope.starts_with("secure-retention-active-") })
-                .count(),
-            MAX_SERIES - 1
-        );
-        let admitted = retained
-            .series
-            .iter()
-            .find(|series| series.key() == new_key)
-            .unwrap();
-        assert_eq!(admitted.samples.len(), 1);
-        assert_eq!(admitted.samples[0].origin, SampleOrigin::LiveV3);
-        assert_eq!(admitted.samples[0].used_percent, 35.0);
-        assert_eq!(admitted.samples[0].sampled_at, now);
-        assert_eq!(admitted.samples[0].reset_at, reset_at);
-        assert_no_windows_secure_temp(&directory);
-        assert_no_windows_corrupt_candidate(&directory);
-        let lock_path = directory.join(HISTORY_LOCK_FILE_NAME);
-        let lock = windows_secure_file_snapshot(&lock_path);
-        assert!(lock.0.is_empty());
-        assert_eq!(lock, windows_secure_file_snapshot(&lock_path));
-
-        drop(cleanup);
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_secure_read_only_transaction_verifies_directory_history_and_lock() {
-        let (directory, path) = windows_secure_temp_path("read-only");
-        let bytes = serde_json::to_vec_pretty(&Store::default()).unwrap();
-        write_windows_secure_file(&path, &bytes);
-        let before = windows_secure_file_snapshot(&path);
-        let now = 4_000_000_000_i64;
-
-        with_locked_transaction_with_mode(
-            StorageMode::System,
-            &path,
-            now,
-            || now,
-            |store| {
-                assert_eq!(store, &Store::default());
-                Ok(())
-            },
-        )
-        .unwrap();
-
-        assert_eq!(windows_secure_file_snapshot(&path), before);
-        assert_no_windows_secure_temp(&directory);
-        assert_no_windows_corrupt_candidate(&directory);
-        let directory_handle =
-            crate::agent_storage_windows::ensure_secure_storage_directory(&directory).unwrap();
-        crate::agent_storage_windows::verify_storage_handle(
-            directory_handle.as_raw_handle() as HANDLE
-        )
-        .unwrap();
-        drop(directory_handle);
-        sync_directory_with_mode(StorageMode::System, &directory).unwrap();
-
-        let lock_path = directory.join(HISTORY_LOCK_FILE_NAME);
-        let first_lock = windows_secure_file_snapshot(&lock_path);
-        let second_lock = windows_secure_file_snapshot(&lock_path);
-        assert_eq!(first_lock, second_lock);
-        assert!(first_lock.0.is_empty());
-
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_secure_rejects_permissive_directory_reparse_history_and_permissive_lock() {
-        {
-            let (directory, path) = windows_secure_temp_path("permissive-directory");
-            let bytes = serde_json::to_vec_pretty(&Store::default()).unwrap();
-            write_windows_secure_file(&path, &bytes);
-            let before = windows_secure_file_snapshot(&path);
-            make_windows_path_permissive(&directory, true);
-
-            assert_eq!(
-                with_locked_transaction_with_mode(
-                    StorageMode::System,
-                    &path,
-                    4_100_000_000,
-                    || 4_100_000_000,
-                    |_| Ok(()),
-                ),
-                Err(HistoryError::StorageUnavailable)
-            );
-            assert_eq!(windows_secure_file_snapshot(&path), before);
-            assert!(
-                crate::agent_storage_windows::ensure_secure_storage_directory(&directory).is_err()
-            );
-            assert!(!directory.join(HISTORY_LOCK_FILE_NAME).exists());
-            assert_no_windows_secure_temp(&directory);
-            assert_no_windows_corrupt_candidate(&directory);
-            fs::remove_dir_all(directory).unwrap();
-        }
-
-        {
-            let (directory, path) = windows_secure_temp_path("reparse-history");
-            let target = directory.join("history-target.json");
-            let bytes = serde_json::to_vec_pretty(&Store::default()).unwrap();
-            write_windows_secure_file(&target, &bytes);
-            let before = windows_secure_file_snapshot(&target);
-            symlink_file(&target, &path).unwrap();
-
-            assert_eq!(
-                with_locked_transaction_with_mode(
-                    StorageMode::System,
-                    &path,
-                    4_200_000_000,
-                    || 4_200_000_000,
-                    |_| Ok(()),
-                ),
-                Err(HistoryError::Read)
-            );
-            assert_eq!(windows_secure_file_snapshot(&target), before);
-            assert!(fs::symlink_metadata(&path)
-                .unwrap()
-                .file_type()
-                .is_symlink());
-            assert_no_windows_secure_temp(&directory);
-            assert_no_windows_corrupt_candidate(&directory);
-            fs::remove_dir_all(directory).unwrap();
-        }
-
-        {
-            let (directory, path) = windows_secure_temp_path("permissive-lock");
-            let bytes = serde_json::to_vec_pretty(&Store::default()).unwrap();
-            write_windows_secure_file(&path, &bytes);
-            let before = windows_secure_file_snapshot(&path);
-            let lock_path = directory.join(HISTORY_LOCK_FILE_NAME);
-            write_windows_secure_file(&lock_path, b"lock-sentinel");
-            make_windows_path_permissive(&lock_path, false);
-            let lock_bytes = fs::read(&lock_path).unwrap();
-
-            assert_eq!(
-                with_locked_transaction_with_mode(
-                    StorageMode::System,
-                    &path,
-                    4_300_000_000,
-                    || 4_300_000_000,
-                    |_| Ok(()),
-                ),
-                Err(HistoryError::LockOpen)
-            );
-            assert_eq!(windows_secure_file_snapshot(&path), before);
-            assert_eq!(fs::read(&lock_path).unwrap(), lock_bytes);
-            assert!(
-                crate::agent_storage_windows::open_existing_secure_file(&lock_path, false).is_err()
-            );
-            assert_no_windows_secure_temp(&directory);
-            assert_no_windows_corrupt_candidate(&directory);
-            fs::remove_dir_all(directory).unwrap();
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_secure_first_save_and_atomic_replacement_install_staged_identity() {
-        let (directory, path) = windows_secure_temp_path("save-activation");
-        let now = 4_400_000_000_i64;
-        let reset = now + DAY;
-
-        assert!(matches!(
-            record_observation_at_path_and_evaluate_with_clock_and_mode(
-                key("secure-save"),
-                Some(reset),
-                10.0,
-                now,
-                provider(reset, DAY),
-                None,
-                &path,
-                StorageMode::System,
-                || now,
-            ),
-            Ok((HistoryOutcome::Ready { sampled: true, .. }, None))
-        ));
-        let first = windows_secure_file_snapshot(&path);
-        let first_store = serde_json::from_slice::<Store>(&first.0).unwrap();
-        assert_eq!(first_store.schema_version, HISTORY_SCHEMA_VERSION);
-        assert_eq!(first_store.series[0].samples.len(), 1);
-        let lock = windows_secure_file_snapshot(&directory.join(HISTORY_LOCK_FILE_NAME));
-        assert!(lock.0.is_empty());
-        assert_no_windows_secure_temp(&directory);
-
-        let later = now + HOUR;
-        let observation_key = key("secure-save");
-        let observations = [observation(observation_key.clone(), reset, 20.0, DAY)];
-        let staged = std::cell::RefCell::new(None);
-        let results = record_observations_at_path_and_evaluate_with_clock_and_mode_and_save(
-            std::slice::from_ref(&observation_key),
-            &observations,
-            later,
-            &path,
-            StorageMode::System,
-            || later,
-            |path, store| {
-                save_store_atomic_windows_secure_with_replace(
-                    path,
-                    store,
-                    |directory_handle, directory, temp, destination| {
-                        staged.replace(Some(windows_secure_file_snapshot(temp)));
-                        crate::agent_storage_windows::replace_secure_file(
-                            directory_handle,
-                            directory,
-                            temp,
-                            destination,
-                        )
-                    },
-                )
-            },
-        )
-        .unwrap();
-        assert!(matches!(
-            &results[0],
-            Ok((HistoryOutcome::Ready { sampled: true, .. }, _, _))
-        ));
-
-        let staged = staged.into_inner().unwrap();
-        let committed = windows_secure_file_snapshot(&path);
-        assert_eq!(committed, staged);
-        assert_ne!((committed.1, committed.2), (first.1, first.2));
-        assert_ne!(committed.0, first.0);
-        let committed_store = serde_json::from_slice::<Store>(&committed.0).unwrap();
-        assert_eq!(committed_store.schema_version, HISTORY_SCHEMA_VERSION);
-        assert_eq!(committed_store.series[0].samples.len(), 2);
-        assert_no_windows_secure_temp(&directory);
-        assert_no_windows_corrupt_candidate(&directory);
-
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_secure_pre_commit_replace_failure_preserves_last_good_and_cleans_staged_temp() {
-        let (directory, path) = windows_secure_temp_path("save-pre-commit-failure");
-        let now = 4_410_000_000_i64;
-        let reset = now + DAY;
-        record_observation_at_path_and_evaluate_with_clock_and_mode(
-            key("secure-pre-commit"),
-            Some(reset),
-            10.0,
-            now,
-            provider(reset, DAY),
-            None,
-            &path,
-            StorageMode::System,
-            || now,
-        )
-        .unwrap();
-        let last_good = windows_secure_file_snapshot(&path);
-
-        let later = now + HOUR;
-        let observation_key = key("secure-pre-commit");
-        let observations = [observation(observation_key.clone(), reset, 20.0, DAY)];
-        let staged = std::cell::RefCell::new(None);
-        assert_eq!(
-            record_observations_at_path_and_evaluate_with_clock_and_mode_and_save(
-                std::slice::from_ref(&observation_key),
-                &observations,
-                later,
-                &path,
-                StorageMode::System,
-                || later,
-                |path, store| {
-                    save_store_atomic_windows_secure_with_replace(
-                        path,
-                        store,
-                        |_directory_handle, _directory, temp, _destination| {
-                            staged.replace(Some(windows_secure_file_snapshot(temp)));
-                            Err(io::Error::other("injected pre-commit replace failure"))
-                        },
-                    )
-                },
-            ),
-            Err(HistoryError::AtomicSave)
-        );
-
-        let staged = staged.into_inner().unwrap();
-        assert_ne!(staged.0, last_good.0);
-        serde_json::from_slice::<Store>(&staged.0).unwrap();
-        assert_eq!(windows_secure_file_snapshot(&path), last_good);
-        assert_no_windows_secure_temp(&directory);
-        assert_no_windows_corrupt_candidate(&directory);
-
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_secure_post_commit_error_reports_failure_without_false_rollback() {
-        let (directory, path) = windows_secure_temp_path("save-post-commit-error");
-        let now = 4_420_000_000_i64;
-        let reset = now + DAY;
-        record_observation_at_path_and_evaluate_with_clock_and_mode(
-            key("secure-post-commit"),
-            Some(reset),
-            10.0,
-            now,
-            provider(reset, DAY),
-            None,
-            &path,
-            StorageMode::System,
-            || now,
-        )
-        .unwrap();
-        let last_good = windows_secure_file_snapshot(&path);
-
-        let later = now + HOUR;
-        let observation_key = key("secure-post-commit");
-        let observations = [observation(observation_key.clone(), reset, 20.0, DAY)];
-        let staged = std::cell::RefCell::new(None);
-        assert_eq!(
-            record_observations_at_path_and_evaluate_with_clock_and_mode_and_save(
-                std::slice::from_ref(&observation_key),
-                &observations,
-                later,
-                &path,
-                StorageMode::System,
-                || later,
-                |path, store| {
-                    save_store_atomic_windows_secure_with_replace(
-                        path,
-                        store,
-                        |directory_handle, directory, temp, destination| {
-                            staged.replace(Some(windows_secure_file_snapshot(temp)));
-                            crate::agent_storage_windows::replace_secure_file(
-                                directory_handle,
-                                directory,
-                                temp,
-                                destination,
-                            )?;
-                            Err(io::Error::other("injected post-commit verification error"))
-                        },
-                    )
-                },
-            ),
-            Err(HistoryError::AtomicSave)
-        );
-
-        let staged = staged.into_inner().unwrap();
-        let committed = windows_secure_file_snapshot(&path);
-        assert_eq!(committed, staged);
-        assert_ne!((committed.1, committed.2), (last_good.1, last_good.2));
-        assert_ne!(committed.0, last_good.0);
-        let committed_store = serde_json::from_slice::<Store>(&committed.0).unwrap();
-        assert_eq!(committed_store.schema_version, HISTORY_SCHEMA_VERSION);
-        assert_eq!(committed_store.series[0].samples.len(), 2);
-        assert_no_windows_secure_temp(&directory);
-        assert_no_windows_corrupt_candidate(&directory);
-
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_secure_corrupt_history_uses_collision_safe_quarantine_then_rebuilds() {
-        let (directory, path) = windows_secure_temp_path("quarantine-activation");
-        write_windows_secure_file(&path, b"corrupt-secure-v3");
-        let source = windows_secure_file_snapshot(&path);
-        let now = 4_500_000_000_i64;
-        let collision = directory.join(format!("quota-pace-history-v3.corrupt-{now}.json"));
-        write_windows_secure_file(&collision, b"existing-collision");
-        let collision_before = windows_secure_file_snapshot(&collision);
-        let source_absent_before_save = std::cell::Cell::new(false);
-        let observation_key = key("secure-quarantine");
-        let observations = [observation(observation_key.clone(), now + DAY, 10.0, DAY)];
-
-        let results = record_observations_at_path_and_evaluate_with_clock_and_mode_and_save(
-            std::slice::from_ref(&observation_key),
-            &observations,
-            now,
-            &path,
-            StorageMode::System,
-            || now,
-            |path, store| {
-                source_absent_before_save.set(matches!(
-                    fs::symlink_metadata(path),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound
-                ));
-                save_store_atomic_windows_secure_with_replace(
-                    path,
-                    store,
-                    crate::agent_storage_windows::replace_secure_file,
-                )
-            },
-        )
-        .unwrap();
-        assert!(matches!(
-            &results[0],
-            Ok((HistoryOutcome::Ready { sampled: true, .. }, _, _))
-        ));
-        assert!(source_absent_before_save.get());
-
-        let quarantined = directory.join(format!("quota-pace-history-v3.corrupt-{now}.1.json"));
-        assert_eq!(windows_secure_file_snapshot(&quarantined), source);
-        assert_eq!(windows_secure_file_snapshot(&collision), collision_before);
-        let rebuilt = windows_secure_file_snapshot(&path);
-        assert_ne!((rebuilt.1, rebuilt.2), (source.1, source.2));
-        let rebuilt_store = serde_json::from_slice::<Store>(&rebuilt.0).unwrap();
-        assert_eq!(rebuilt_store.schema_version, HISTORY_SCHEMA_VERSION);
-        assert_eq!(rebuilt_store.series[0].samples.len(), 1);
-        assert_no_windows_secure_temp(&directory);
-
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_secure_v2_valid_import_is_idempotent_and_invalid_inputs_remain_read_only() {
-        let now = 6_000_000_000_i64;
-        let duration = 10_080 * 60;
-        let reset = now - 2 * duration;
-        let valid_v2_samples = complete_cycle(reset, duration, 80.0)
-            .into_iter()
-            .map(|sample| {
-                serde_json::json!({
-                    "accountKey": "acct",
-                    "resetsAt": reset,
-                    "windowMinutes": 10080,
-                    "usedPercent": sample.used_percent,
-                    "sampledAt": sample.sampled_at
-                })
-            })
-            .collect::<Vec<_>>();
-        let valid_v2 = serde_json::to_vec_pretty(&serde_json::json!({
-            "schemaVersion": 2,
-            "samples": valid_v2_samples
-        }))
-        .unwrap();
-
-        {
-            let (directory, v3_path) = windows_secure_temp_path("migration-valid");
-            let v2_path = directory.join(LEGACY_V2_FILE_NAME);
-            write_windows_secure_file(&v2_path, &valid_v2);
-            let v2_before = windows_secure_file_snapshot(&v2_path);
-            let v2_mtime = fs::metadata(&v2_path).unwrap().modified().unwrap();
-
-            assert_eq!(
-                migrate_codex_v2_at_paths_with_clock_and_mode(
-                    "acct",
-                    &HistoryScope::for_test("opaque-scope"),
-                    now,
-                    &v2_path,
-                    &v3_path,
-                    StorageMode::System,
-                    || now,
-                ),
-                Ok(MigrationOutcome {
-                    imported_samples: 8,
-                    skipped_samples: 0,
-                })
-            );
-            assert_eq!(windows_secure_file_snapshot(&v2_path), v2_before);
-            assert_eq!(
-                fs::metadata(&v2_path).unwrap().modified().unwrap(),
-                v2_mtime
-            );
-            let v3_after_first = windows_secure_file_snapshot(&v3_path);
-            let migrated = serde_json::from_slice::<Store>(&v3_after_first.0).unwrap();
-            assert_eq!(migrated.schema_version, HISTORY_SCHEMA_VERSION);
-            assert_eq!(migrated.series.len(), 1);
-            assert_eq!(migrated.series[0].account_scope, "opaque-scope");
-            assert_eq!(migrated.series[0].samples.len(), 8);
-            assert_eq!(
-                migrated.series[0].samples[0].origin,
-                SampleOrigin::ImportedV2
-            );
-            let lock = windows_secure_file_snapshot(&directory.join(HISTORY_LOCK_FILE_NAME));
-            assert!(lock.0.is_empty());
-            assert_no_windows_secure_temp(&directory);
-            assert_no_windows_corrupt_candidate(&directory);
-
-            assert_eq!(
-                migrate_codex_v2_at_paths_with_clock_and_mode(
-                    "acct",
-                    &HistoryScope::for_test("opaque-scope"),
-                    now,
-                    &v2_path,
-                    &v3_path,
-                    StorageMode::System,
-                    || now,
-                ),
-                Ok(MigrationOutcome {
-                    imported_samples: 0,
-                    skipped_samples: 0,
-                })
-            );
-            assert_eq!(windows_secure_file_snapshot(&v2_path), v2_before);
-            assert_eq!(
-                fs::metadata(&v2_path).unwrap().modified().unwrap(),
-                v2_mtime
-            );
-            assert_eq!(windows_secure_file_snapshot(&v3_path), v3_after_first);
-            assert_no_windows_secure_temp(&directory);
-            assert_no_windows_corrupt_candidate(&directory);
-            fs::remove_dir_all(directory).unwrap();
-        }
-
-        {
-            let (directory, v3_path) = windows_secure_temp_path("migration-permissive-v2");
-            let v2_path = directory.join(LEGACY_V2_FILE_NAME);
-            write_windows_secure_file(&v2_path, &valid_v2);
-            make_windows_path_permissive(&v2_path, false);
-            write_windows_secure_file(
-                &v3_path,
-                &serde_json::to_vec_pretty(&Store::default()).unwrap(),
-            );
-            let v2_before = fs::read(&v2_path).unwrap();
-            let v2_mtime = fs::metadata(&v2_path).unwrap().modified().unwrap();
-            let v3_before = windows_secure_file_snapshot(&v3_path);
-
-            assert_eq!(
-                migrate_codex_v2_at_paths_with_clock_and_mode(
-                    "acct",
-                    &HistoryScope::for_test("opaque-scope"),
-                    now,
-                    &v2_path,
-                    &v3_path,
-                    StorageMode::System,
-                    || now,
-                ),
-                Ok(MigrationOutcome {
-                    imported_samples: 0,
-                    skipped_samples: 0,
-                })
-            );
-            assert_eq!(fs::read(&v2_path).unwrap(), v2_before);
-            assert_eq!(
-                fs::metadata(&v2_path).unwrap().modified().unwrap(),
-                v2_mtime
-            );
-            assert!(
-                crate::agent_storage_windows::open_existing_secure_file(&v2_path, false).is_err()
-            );
-            assert_eq!(windows_secure_file_snapshot(&v3_path), v3_before);
-            assert!(!directory.join(HISTORY_LOCK_FILE_NAME).exists());
-            assert_no_windows_secure_temp(&directory);
-            assert_no_windows_corrupt_candidate(&directory);
-            fs::remove_dir_all(directory).unwrap();
-        }
-
-        {
-            let (directory, v3_path) = windows_secure_temp_path("migration-corrupt-v2");
-            let v2_path = directory.join(LEGACY_V2_FILE_NAME);
-            write_windows_secure_file(&v2_path, b"corrupt-secure-v2");
-            write_windows_secure_file(
-                &v3_path,
-                &serde_json::to_vec_pretty(&Store::default()).unwrap(),
-            );
-            let v2_before = windows_secure_file_snapshot(&v2_path);
-            let v2_mtime = fs::metadata(&v2_path).unwrap().modified().unwrap();
-            let v3_before = windows_secure_file_snapshot(&v3_path);
-
-            assert_eq!(
-                migrate_codex_v2_at_paths_with_clock_and_mode(
-                    "acct",
-                    &HistoryScope::for_test("opaque-scope"),
-                    now,
-                    &v2_path,
-                    &v3_path,
-                    StorageMode::System,
-                    || now,
-                ),
-                Ok(MigrationOutcome {
-                    imported_samples: 0,
-                    skipped_samples: 0,
-                })
-            );
-            assert_eq!(windows_secure_file_snapshot(&v2_path), v2_before);
-            assert_eq!(
-                fs::metadata(&v2_path).unwrap().modified().unwrap(),
-                v2_mtime
-            );
-            assert_eq!(windows_secure_file_snapshot(&v3_path), v3_before);
-            assert!(!directory.join(HISTORY_LOCK_FILE_NAME).exists());
-            assert_no_windows_secure_temp(&directory);
-            assert_no_windows_corrupt_candidate(&directory);
-            fs::remove_dir_all(directory).unwrap();
-        }
-
-        {
-            let (directory, v3_path) = windows_secure_temp_path("migration-missing-v2");
-            let v2_path = directory.join(LEGACY_V2_FILE_NAME);
-            write_windows_secure_file(
-                &v3_path,
-                &serde_json::to_vec_pretty(&Store::default()).unwrap(),
-            );
-            let v3_before = windows_secure_file_snapshot(&v3_path);
-
-            assert_eq!(
-                migrate_codex_v2_at_paths_with_clock_and_mode(
-                    "acct",
-                    &HistoryScope::for_test("opaque-scope"),
-                    now,
-                    &v2_path,
-                    &v3_path,
-                    StorageMode::System,
-                    || now,
-                ),
-                Ok(MigrationOutcome {
-                    imported_samples: 0,
-                    skipped_samples: 0,
-                })
-            );
-            assert!(!v2_path.exists());
-            assert_eq!(windows_secure_file_snapshot(&v3_path), v3_before);
-            assert!(!directory.join(HISTORY_LOCK_FILE_NAME).exists());
-            assert_no_windows_secure_temp(&directory);
-            assert_no_windows_corrupt_candidate(&directory);
-            fs::remove_dir_all(directory).unwrap();
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_system_history_skips_insecure_legacy_v2_and_writes_live_v3_to_fallback() {
-        let (root, _) = temp_path("resolved-secure-root");
-        let preferred = root.join("com.nyanako.tokenbar");
-        let fallback = root.join("com.nyanako.tokenbar.secure");
-        fs::create_dir(&preferred).expect("create inherited legacy preferred root");
-        assert!(
-            crate::agent_storage_windows::ensure_secure_storage_directory(&preferred).is_err(),
-            "legacy preferred root is not exact secure"
-        );
-
-        let now = 6_100_000_000_i64;
-        let v2_path = preferred.join(LEGACY_V2_FILE_NAME);
-        fs::write(
-            &v2_path,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "schemaVersion": 2,
-                "samples": [{
-                    "accountKey": "acct",
-                    "resetsAt": now + 10_080 * 60,
-                    "windowMinutes": 10_080,
-                    "usedPercent": 25.0,
-                    "sampledAt": now
-                }]
-            }))
-            .unwrap(),
-        )
-        .expect("write legacy v2 through general filesystem API");
-        make_windows_path_permissive(&v2_path, false);
-        let v2_bytes = fs::read(&v2_path).unwrap();
-        let v2_mtime = fs::metadata(&v2_path).unwrap().modified().unwrap();
-        let v2_identity = windows_file_identity(&v2_path);
-
-        let resolved = crate::agent_storage_windows::resolve_secure_storage_directory(&preferred)
-            .expect("resolve exact secure fallback");
-        assert_eq!(resolved, fallback);
-        let v3_path = resolved.join(HISTORY_FILE_NAME);
-        assert_eq!(
-            migrate_codex_v2_at_paths_with_clock_and_mode(
-                "acct",
-                &HistoryScope::for_test("opaque-scope"),
-                now,
-                &v2_path,
-                &v3_path,
-                StorageMode::System,
-                || now,
-            ),
-            Ok(MigrationOutcome {
-                imported_samples: 0,
-                skipped_samples: 0,
-            })
-        );
-        assert!(!v3_path.exists());
-        assert!(!resolved.join(HISTORY_LOCK_FILE_NAME).exists());
-        assert_eq!(fs::read(&v2_path).unwrap(), v2_bytes);
-        assert_eq!(
-            fs::metadata(&v2_path).unwrap().modified().unwrap(),
-            v2_mtime
-        );
-        assert_eq!(windows_file_identity(&v2_path), v2_identity);
-        assert!(
-            crate::agent_storage_windows::open_existing_secure_file(&v2_path, false).is_err(),
-            "legacy v2 remains insecure and is never repaired in place"
-        );
-
-        let reset = now + DAY;
-        assert!(matches!(
-            record_observation_at_path_and_evaluate_with_clock_and_mode(
-                key("fallback-live-v3"),
-                Some(reset),
-                30.0,
-                now,
-                provider(reset, DAY),
-                None,
-                &v3_path,
-                StorageMode::System,
-                || now,
-            ),
-            Ok((HistoryOutcome::Ready { sampled: true, .. }, None))
-        ));
-        let v3 = windows_secure_file_snapshot(&v3_path);
-        let store = serde_json::from_slice::<Store>(&v3.0).unwrap();
-        assert_eq!(store.schema_version, HISTORY_SCHEMA_VERSION);
-        assert_eq!(store.series.len(), 1);
-        assert!(
-            windows_secure_file_snapshot(&resolved.join(HISTORY_LOCK_FILE_NAME))
-                .0
-                .is_empty()
-        );
-        assert_no_windows_secure_temp(&resolved);
-        assert_no_windows_corrupt_candidate(&resolved);
-
-        assert_eq!(fs::read(&v2_path).unwrap(), v2_bytes);
-        assert_eq!(
-            fs::metadata(&v2_path).unwrap().modified().unwrap(),
-            v2_mtime
-        );
-        assert_eq!(windows_file_identity(&v2_path), v2_identity);
-        assert!(!preferred.join(HISTORY_FILE_NAME).exists());
-        assert!(!preferred.join(HISTORY_LOCK_FILE_NAME).exists());
-        assert!(
-            crate::agent_storage_windows::ensure_secure_storage_directory(&preferred).is_err(),
-            "legacy preferred ACL remains unchanged"
-        );
-
-        fs::remove_dir_all(root).unwrap();
     }
 
     /// Rewrite an on-disk v4 store into the exact shape a v3 build wrote:
@@ -5817,7 +4983,9 @@ mod tests {
                 "under 28h the fraction is below the quantum, so the floor must govern"
             );
             let base = 10_080_000;
-            for gap in [0, 1, 29, 30, 31, 89, 90, 91, 179, 180, 181, 300, 359, 360, 900, 3600] {
+            for gap in [
+                0, 1, 29, 30, 31, 89, 90, 91, 179, 180, 181, 300, 359, 360, 900, 3600,
+            ] {
                 assert_eq!(
                     reset_superseded(base, base + gap, duration),
                     resets_differ_beyond_quantum(base, base + gap, duration),
@@ -5890,7 +5058,9 @@ mod tests {
         // would prove nothing.
         let mut series = SeriesState::new(&key("acct"), base);
         series.samples = complete_cycle(base, nominal, 80.0);
-        series.samples.extend(observed_cycle(successor, cut_short, 12.0));
+        series
+            .samples
+            .extend(observed_cycle(successor, cut_short, 12.0));
         series.samples.sort_by(sample_order);
         assert!(
             !reset_superseded(base, successor, nominal),
@@ -7461,7 +6631,7 @@ mod tests {
     }
 
     #[test]
-    fn future_sample_evidence_drops_only_that_series() {
+    fn future_sample_evidence_drops_only_that_sample() {
         let (directory, path) = temp_path("clock-future-sample");
         let upper_bound = 21_000_000;
         let observation_now = upper_bound;
@@ -7487,7 +6657,9 @@ mod tests {
         // This sample's own sampled_at leads the ceiling, which forces
         // last_activity_at (>= every sample) to lead it too, per
         // activity_valid — this series is structurally valid but
-        // unverifiable, not merely metadata-ahead.
+        // unverifiable, not merely metadata-ahead. The earlier reading beside
+        // it is verifiable and must survive.
+        let past_sample = quota_sample(reset, 2 * DAY, 0.20, 20.0, SampleOrigin::LiveV3);
         let tainted_sample = QuotaSample {
             reset_at: reset,
             duration_seconds: 2 * DAY,
@@ -7497,6 +6669,7 @@ mod tests {
             origin: SampleOrigin::LiveV3,
             plan: None,
         };
+        assert!(past_sample.sampled_at <= upper_bound);
         let tainted = SeriesState {
             provider_id: "claude".into(),
             account_scope: "acct".into(),
@@ -7504,7 +6677,7 @@ mod tests {
             active_reset_at: Some(reset),
             last_activity_at: tainted_sample.sampled_at,
             rollover: None,
-            samples: vec![tainted_sample],
+            samples: vec![past_sample.clone(), tainted_sample],
         };
 
         let mut store = Store {
@@ -7520,8 +6693,25 @@ mod tests {
                 .unwrap();
         assert!(!loaded.quarantined);
         assert!(validate_store_at(&loaded.store, upper_bound));
-        assert_eq!(loaded.store.series.len(), 1);
-        assert_eq!(loaded.store.series[0], healthy, "sibling is untouched");
+        assert_eq!(loaded.store.series.len(), 2, "no series is dropped");
+        let sibling = loaded
+            .store
+            .series
+            .iter()
+            .find(|s| s.window_key == "session.v1")
+            .unwrap();
+        assert_eq!(*sibling, healthy, "sibling is untouched");
+        let repaired = loaded
+            .store
+            .series
+            .iter()
+            .find(|s| s.window_key == "weekly.v1")
+            .unwrap();
+        assert_eq!(
+            repaired.samples,
+            vec![past_sample],
+            "only the sample past the ceiling goes"
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }
@@ -8043,13 +7233,22 @@ mod tests {
             active_reset_at: Some(reset),
             last_activity_at: lead,
             rollover: Some(watching_rollover(reset, lead - 100, lead)),
-            samples: vec![quota_sample(
-                reset,
-                2 * DAY,
-                0.10,
-                20.0,
-                SampleOrigin::LiveV3,
-            )],
+            samples: vec![
+                quota_sample(reset, 2 * DAY, 0.10, 20.0, SampleOrigin::LiveV3),
+                // Between `observation_now` and the ceiling: kept, and it
+                // becomes the clamp's floor.
+                QuotaSample {
+                    sampled_at: upper_bound - 500,
+                    used_percent: 30.0,
+                    ..quota_sample(reset, 2 * DAY, 0.10, 20.0, SampleOrigin::LiveV3)
+                },
+                // Past the ceiling: dropped by the first pass.
+                QuotaSample {
+                    sampled_at: lead,
+                    used_percent: 40.0,
+                    ..quota_sample(reset, 2 * DAY, 0.10, 20.0, SampleOrigin::LiveV3)
+                },
+            ],
         };
         let store = Store {
             schema_version: HISTORY_SCHEMA_VERSION,
@@ -8057,8 +7256,291 @@ mod tests {
         };
 
         let once = repair_store_at(store.clone(), upper_bound, observation_now);
+        // Control: the first pass really did remove the future sample.
+        assert_eq!(once.series[0].samples.len(), 2);
+        assert_eq!(once.series[0].last_activity_at, upper_bound - 500);
         let twice = repair_store_at(once.clone(), upper_bound, observation_now);
         assert_eq!(once, twice);
+    }
+
+    /// Run a transaction whose body changes nothing, so any save it makes is
+    /// the loader's repair reaching disk and nothing else.
+    fn no_op_transaction(path: &Path, observation_now: i64, lock_time: i64) {
+        with_locked_transaction_with_mode(
+            StorageMode::Generic,
+            path,
+            observation_now,
+            || lock_time,
+            |_store| Ok(()),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_load_time_clock_repair_reaches_disk_once() {
+        let (directory, path) = temp_path("persist-clock-repair");
+        let upper_bound = 33_000_000;
+        let observation_now = upper_bound - 100;
+        let trigger = SeriesState {
+            provider_id: "claude".into(),
+            account_scope: "acct".into(),
+            window_key: "session.v1".into(),
+            active_reset_at: None,
+            last_activity_at: upper_bound + 50,
+            rollover: None,
+            samples: Vec::new(),
+        };
+        let sibling = SeriesState {
+            provider_id: "copilot".into(),
+            account_scope: "acct".into(),
+            window_key: "premium_interactions.v1".into(),
+            active_reset_at: None,
+            last_activity_at: upper_bound - 10,
+            rollover: None,
+            samples: Vec::new(),
+        };
+        let mut store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![trigger, sibling],
+        };
+        store.series.sort_by(series_order);
+        // Control: the file on disk leads the ceiling, so the loader repairs it.
+        assert!(validate_store(&store));
+        assert!(!validate_store_at(&store, upper_bound));
+        fs::write(&path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
+
+        reset_save_call_count();
+        no_op_transaction(&path, observation_now, upper_bound);
+        assert_eq!(save_call_count(), 1, "the repair must be written once");
+        let on_disk = read_store(&path);
+        assert!(
+            validate_store_at(&on_disk, upper_bound),
+            "the written file must no longer need the repair"
+        );
+        let mut windows = on_disk
+            .series
+            .iter()
+            .map(|series| series.window_key.as_str())
+            .collect::<Vec<_>>();
+        windows.sort_unstable();
+        assert_eq!(
+            windows,
+            ["premium_interactions.v1", "session.v1"],
+            "the clamped trigger and the sibling are both written"
+        );
+
+        no_op_transaction(&path, observation_now, upper_bound);
+        assert_eq!(save_call_count(), 1, "a repaired file is not rewritten");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_load_time_sample_drop_reaches_disk_once() {
+        let (directory, path) = temp_path("persist-sample-drop");
+        let now = 34_000_000;
+        let reset = now + 3 * HOUR;
+        let duration_seconds = 5 * HOUR;
+        // Phase 0.2 puts both readings an hour before `now`, so the only
+        // repair the loader has to make is the collision, not the clock.
+        let first = quota_sample(reset, duration_seconds, 0.20, 30.0, SampleOrigin::LiveV3);
+        // Same phase bucket as `first`, so the two share a `sample_key`.
+        let second = QuotaSample {
+            sampled_at: first.sampled_at + 10,
+            used_percent: 31.0,
+            ..first.clone()
+        };
+        let series = SeriesState {
+            provider_id: "claude".into(),
+            account_scope: "acct".into(),
+            window_key: "session.v1".into(),
+            active_reset_at: Some(reset),
+            last_activity_at: second.sampled_at,
+            rollover: None,
+            samples: vec![first.clone(), second.clone()],
+        };
+        let store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![series],
+        };
+        // Control: the two samples collide, so the loader has to drop one.
+        assert_eq!(sample_key(&first), sample_key(&second));
+        assert!(!validate_store(&store));
+        fs::write(&path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
+
+        reset_save_call_count();
+        no_op_transaction(&path, now, now);
+        assert_eq!(save_call_count(), 1, "the drop must be written once");
+        let on_disk = read_store(&path);
+        assert!(validate_store_at(&on_disk, now));
+        assert_eq!(
+            on_disk.series[0].samples,
+            vec![second],
+            "the newer reading is kept"
+        );
+
+        no_op_transaction(&path, now, now);
+        assert_eq!(save_call_count(), 1, "a repaired file is not rewritten");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_future_sample_drop_reaches_disk_once_and_keeps_the_series() {
+        let (directory, path) = temp_path("persist-future-sample");
+        let upper_bound = 37_000_000;
+        let observation_now = upper_bound - 1_000;
+        let reset = upper_bound + DAY;
+        let past_sample = quota_sample(reset, 2 * DAY, 0.20, 20.0, SampleOrigin::LiveV3);
+        // A clock that stepped back leaves this reading stamped past the
+        // ceiling; it is the only thing the repair may remove.
+        let future_sample = QuotaSample {
+            reset_at: reset,
+            duration_seconds: 2 * DAY,
+            duration_source: DurationSource::Provider,
+            used_percent: 40.0,
+            // Two hours past, so its phase bucket differs from the reading at
+            // the ceiling and the loader's duplicate pass cannot touch either.
+            sampled_at: upper_bound + 2 * HOUR,
+            origin: SampleOrigin::LiveV3,
+            plan: None,
+        };
+        // Both at or below the ceiling, one of them above `observation_now`:
+        // the boundary is `<= upper_bound`, and neither may be lost.
+        let at_ceiling = QuotaSample {
+            sampled_at: upper_bound,
+            used_percent: 35.0,
+            ..past_sample.clone()
+        };
+        let before_ceiling = QuotaSample {
+            sampled_at: upper_bound - 500,
+            used_percent: 34.0,
+            ..past_sample.clone()
+        };
+        assert!(before_ceiling.sampled_at > observation_now);
+        let keys = [&past_sample, &before_ceiling, &at_ceiling, &future_sample]
+            .map(sample_key)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(keys.len(), 4, "every reading sits in its own bucket");
+        let kept = vec![past_sample.clone(), before_ceiling, at_ceiling];
+        let store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![SeriesState {
+                provider_id: "grok".into(),
+                account_scope: "acct".into(),
+                window_key: "weekly.v1".into(),
+                active_reset_at: Some(reset),
+                last_activity_at: future_sample.sampled_at,
+                rollover: None,
+                samples: kept.iter().cloned().chain([future_sample]).collect(),
+            }],
+        };
+        // Control: the file needs the clock repair.
+        assert!(validate_store(&store));
+        assert!(!validate_store_at(&store, upper_bound));
+        fs::write(&path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
+
+        reset_save_call_count();
+        no_op_transaction(&path, observation_now, upper_bound);
+        assert_eq!(save_call_count(), 1, "the repair must be written once");
+        let on_disk = read_store(&path);
+        assert!(validate_store_at(&on_disk, upper_bound));
+        assert_eq!(on_disk.series.len(), 1, "the series survives on disk");
+        assert_eq!(
+            on_disk.series[0].samples,
+            kept,
+            "every reading at or below the ceiling survives on disk"
+        );
+
+        no_op_transaction(&path, observation_now, upper_bound);
+        assert_eq!(save_call_count(), 1, "a repaired file is not rewritten");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_failed_repair_write_back_does_not_fail_the_transaction() {
+        let (directory, path) = temp_path("persist-save-failure");
+        let upper_bound = 36_000_000;
+        let observation_now = upper_bound - 100;
+        let store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![SeriesState {
+                provider_id: "claude".into(),
+                account_scope: "acct".into(),
+                window_key: "session.v1".into(),
+                active_reset_at: None,
+                last_activity_at: upper_bound + 50,
+                rollover: None,
+                samples: Vec::new(),
+            }],
+        };
+        assert!(!validate_store_at(&store, upper_bound));
+        fs::write(&path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
+        let failing_save = |_: &Path, _: &Store| Err(io::Error::other("disk full"));
+
+        let repair_only = with_locked_transaction_with_save_and_mode(
+            StorageMode::Generic,
+            &path,
+            observation_now,
+            || upper_bound,
+            failing_save,
+            |_store| Ok(7),
+        );
+        assert_eq!(repair_only, Ok(7), "the body's result survives");
+
+        // Control: a body that changed the store still reports the failure.
+        let body_changed = with_locked_transaction_with_save_and_mode(
+            StorageMode::Generic,
+            &path,
+            observation_now,
+            || upper_bound,
+            failing_save,
+            |store| {
+                store.series.clear();
+                Ok(7)
+            },
+        );
+        assert_eq!(body_changed, Err(HistoryError::AtomicSave));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_v3_stamp_alone_is_not_written_by_a_no_op_transaction() {
+        let (directory, path) = temp_path("persist-v3-lazy");
+        let now = 35_000_000;
+        let reset = now + 3 * HOUR;
+        let sample = quota_sample(reset, 5 * HOUR, 0.40, 30.0, SampleOrigin::LiveV3);
+        let store = Store {
+            schema_version: HISTORY_SCHEMA_VERSION,
+            series: vec![SeriesState {
+                provider_id: "claude".into(),
+                account_scope: "acct".into(),
+                window_key: "session.v1".into(),
+                active_reset_at: Some(reset),
+                last_activity_at: sample.sampled_at,
+                rollover: None,
+                samples: vec![sample],
+            }],
+        };
+        assert!(validate_store_at(&store, now));
+        fs::write(&path, serde_json::to_vec_pretty(&store).unwrap()).unwrap();
+        // Control: the fixture really is a v3 file, not a v4 one.
+        assert_eq!(downgrade_file_to_v3(&path), 1);
+        let v3_bytes = fs::read(&path).unwrap();
+
+        reset_save_call_count();
+        no_op_transaction(&path, now, now);
+        assert_eq!(
+            save_call_count(),
+            0,
+            "the version stamp alone must not write"
+        );
+        assert_eq!(fs::read(&path).unwrap(), v3_bytes);
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -9180,6 +8662,60 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(cycle_profile(reset, &middle_only, reset + 1).is_none());
+    }
+
+    #[test]
+    fn a_record_group_cannot_spend_the_cycle_budget() {
+        let duration = 7 * DAY;
+        let now = 3_000_000_000;
+        let current_reset = now + duration;
+        // Twelve cycles against a budget of eight, so the budget is saturated.
+        // That is the only state where the two budgets differ, and it is where
+        // a real store lives: `claude/session.v1` on the store behind #370
+        // holds 133 groups against a cap of 128.
+        let mut without = seeded_series("provider", "scope", "window.v1", current_reset, duration, 12);
+        let mut with = without.clone();
+
+        // Newer than the oldest cycle the budget keeps, so a shared budget
+        // would have let it evict that cycle. Substantial — six distinct
+        // buckets — and unmodellable, because it stops at phase 0.75 and
+        // `cycle_meets_retention_coverage` wants the last reading past 0.90.
+        let partial_reset = current_reset - duration * 3 / 2;
+        with.samples.extend([0.01, 0.10, 0.25, 0.40, 0.60, 0.75].into_iter().map(|phase| {
+            quota_sample(
+                partial_reset,
+                duration,
+                phase,
+                40.0 * phase + 1.0,
+                SampleOrigin::LiveV3,
+            )
+        }));
+
+        retain_series(&mut without, now);
+        retain_series(&mut with, now);
+
+        // Control: the record survives. Without this the equality below is
+        // satisfied by retention having thrown the record away, which is the
+        // behaviour this change exists to stop.
+        let partial_group = normalize_reset(partial_reset, duration);
+        assert!(
+            with.samples.iter().any(|sample| {
+                normalize_reset(sample.reset_at, sample.duration_seconds) == partial_group
+            }),
+            "the record group must survive, or this proves nothing"
+        );
+        // Control: the cycle budget really is full, so a displacement had
+        // somewhere to happen.
+        assert_eq!(
+            retention_cycles(&without, now).len(),
+            RETENTION_MIN_CYCLES,
+            "fixture must saturate the cycle budget"
+        );
+        assert_eq!(
+            retention_cycles(&with, now).len(),
+            retention_cycles(&without, now).len(),
+            "a record must not cost the model a cycle"
+        );
     }
 
     #[test]
@@ -10653,13 +10189,36 @@ mod tests {
             );
             assert_eq!(pace.is_some(), expect_pace, "{label} current-only result");
             let persisted = read_store(&path);
-            assert!(persisted.series[0].samples.iter().all(|sample| {
-                normalize_reset(sample.reset_at, duration)
-                    == normalize_reset(current_reset, duration)
-            }));
-            assert!(!persisted.series[0].samples.iter().any(|sample| {
-                normalize_reset(sample.reset_at, duration) == normalize_reset(stale_reset, duration)
-            }));
+            // The stale group stops at phase 0.60, so `has_end` refuses it and
+            // it can never be modelled. It used to be deleted for that, which
+            // is how #370 erased a window that had been sampled for days the
+            // moment a write outage stopped its tail arriving. It is kept now,
+            // and the two assertions above are what prove keeping it is safe:
+            // `complete_cycles` is still 0 and the pace verdict is unchanged,
+            // so the record persists without reaching the model.
+            //
+            // The stale group is identified as "not the current one" rather
+            // than by recomputing its reset. `normalize_reset(stale_reset,
+            // duration)` names a value no stored sample carries, so the
+            // assertion this replaces — `!any(reset == that value)` — was
+            // comparing against nothing and would have passed whatever
+            // retention did with the group.
+            let current_group = normalize_reset(current_reset, duration);
+            let (current_kept, stale_kept): (Vec<_>, Vec<_>) =
+                persisted.series[0].samples.iter().partition(|sample| {
+                    normalize_reset(sample.reset_at, sample.duration_seconds) == current_group
+                });
+            assert_eq!(
+                stale_kept.len(),
+                phases.len(),
+                "{label} must keep the stale partial as a record"
+            );
+            assert_eq!(
+                current_kept.len(),
+                phases.len(),
+                "{label} control: the current group is present too, so the count \
+                 above is a retention result and not a store holding one group"
+            );
             fs::remove_dir_all(directory).unwrap();
         }
     }

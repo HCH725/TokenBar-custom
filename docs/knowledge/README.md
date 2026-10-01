@@ -3,16 +3,16 @@ status: active
 id: kb-index
 kind: index
 scope: repository
-read_when: before any TokenBar task or handoff
-last_verified: 2026-09-10
-sources: ["README.md", "CONTRIBUTING.md", "AGENTS.md", "Makefile", "Package.swift", ".github/workflows/ci.yml", ".github/workflows/pages.yml", ".github/workflows/release.yml", ".github/workflows/update-install-count.yml"]
+read_when: before any Syrtis task or handoff
+last_verified: 2026-09-27
+sources: ["README.md", "CONTRIBUTING.md", "AGENTS.md", "Makefile", "Package.swift", ".github/workflows/ci.yml", ".github/workflows/ci-release.yml", ".github/workflows/pages.yml", ".github/workflows/release.yml", ".github/workflows/update-install-count.yml"]
 ---
 
-# TokenBar project knowledge
+# Syrtis project knowledge
 
 ## 文件目的
 
-這份索引是 TokenBar 的 canonical project knowledge entry point。它把架構、工作流程、驗證、shared tokscale engine、發版、溝通、目前狀態與歷史決策分開保存，讓人類維護者與不同 coding client 都能從同一份 project-owned source 接手。
+這份索引是 Syrtis 的 canonical project knowledge entry point。它把架構、工作流程、驗證、shared tokscale engine、發版、溝通、目前狀態與歷史決策分開保存，讓人類維護者與不同 coding client 都能從同一份 project-owned source 接手。
 
 公開 contributor 從 [`CONTRIBUTING.md`](../../CONTRIBUTING.md) 進入；該文件負責 onboarding、穩定 guardrail 與任務路由，技術與流程事實仍由本 knowledge tree 擁有。
 
@@ -85,8 +85,9 @@ docs/knowledge/
 
 | Source | Authority |
 |---|---|
-| Private canonical [`tokscale-core-custom/UPSTREAM.md`](https://github.com/HCH725/tokscale-core-custom/blob/dad446ddea70a6c751c1eb338c5c03112df83af6/UPSTREAM.md) + [`CUSTOM.md`](https://github.com/HCH725/tokscale-core-custom/blob/dad446ddea70a6c751c1eb338c5c03112df83af6/CUSTOM.md) | Exact reviewed shared-engine upstream baseline and private contract for the current Native consumer pin |
-| `vendor/README.md` | TokenBar's shared-engine repository and reviewed consumer pin |
+| Public [`tokscale-core/UPSTREAM.md` at `319ffa8`](https://github.com/Nanako0129/tokscale-core/blob/319ffa8ca75f6cd2bfaf96ae0d295a8fa618ec2c/UPSTREAM.md) | Exact public shared-engine upstream baseline and history |
+| Private `HCH725/tokscale-core-custom/CUSTOM.md` | Surviving private CatDesk/OpenCode Go/Codex engine contract layered on that baseline |
+| `vendor/README.md` | Syrtis's canonical private engine repository, public baseline, and reviewed consumer pin |
 | `.github/workflows/*.yml` | Runtime CI, Pages, release, and install-count gates |
 | `Makefile` | Local build order and stale Rust static-library relink guard |
 | `Package.swift` | SwiftPM targets and linker contract |

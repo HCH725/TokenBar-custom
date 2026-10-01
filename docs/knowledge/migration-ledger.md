@@ -4,7 +4,7 @@ id: kb-migration-ledger
 kind: ledger
 scope: repository
 read_when: auditing knowledge coverage, adding a memory/plan source, or deciding what stays private
-last_verified: 2026-09-15
+last_verified: 2026-10-01
 sources: ["memory index", "project memory set", "plan set", "sanitized local guidance source", "sanitized local visual-experiment source"]
 source_total: 58
 memory_count: 37
@@ -122,7 +122,7 @@ A future client may import private material through a local `.agent-local/` over
 
 ## Other-project sources
 
-Rows marked `other-project` are retained only to prove that sources outside TokenBar were classified and excluded. They identify no project, product, domain, infrastructure type, toolchain, or work item; lifecycle remains in the status and treatment fields, while all source content stays outside this repository.
+Rows marked `other-project` are retained only to prove that sources outside Syrtis were classified and excluded. They identify no project, product, domain, infrastructure type, toolchain, or work item; lifecycle remains in the status and treatment fields, while all source content stays outside this repository.
 
 ## No-gaps verification
 
@@ -134,5 +134,5 @@ Rows marked `other-project` are retained only to prove that sources outside Toke
 | Duplicate handling | One row for the upstream-report plan and one row for the project-private follow-up; subjects are split in treatment, not duplicated as sources |
 | Destination coverage | Every row has a non-empty canonical destination or an explicit private/other-project retention section |
 | Privacy scan | No source filename, absolute local path, credential value/location, private environment, machine-specific tooling, or unpublished material is copied |
-| Source hierarchy | Exact shared-engine alignment facts remain in the engine `UPSTREAM.md`; TokenBar's reviewed pin remains in `vendor/README.md`; runtime gates remain in workflow YAML; this ledger records migration treatment only |
+| Source hierarchy | Exact shared-engine alignment facts remain in the engine `UPSTREAM.md`; Syrtis's reviewed pin remains in `vendor/README.md`; runtime gates remain in workflow YAML; this ledger records migration treatment only |
 | Validator boundary | The tracked validator checks the exact ledger structure; 58-source reconciliation remains a local external audit |

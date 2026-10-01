@@ -8,7 +8,7 @@
 //! macOS Keychain. Query DashboardService/GetSandUsageStatus with that account
 //! and its selected team, just as the desktop app does. Fall back to the
 //! Cursor IDE's `state.vscdb` only when no desktop login exists.
-//! Credentials are read-only and never logged or persisted by TokenBar.
+//! Credentials are read-only and never logged or persisted by Syrtis.
 //! Grok Bot owns token refresh; expired logins produce an actionable error.
 //!
 //! `TOKENBAR_GROK_BOT_SECRETS` / `TOKENBAR_CURSOR_STATE_VSCDB` override the
@@ -96,11 +96,7 @@ impl GrokBotCredentials {
                 access_token,
                 team_id,
             } => {
-                let payload = access_token.split('.').nth(1)?;
-                let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .decode(payload.trim_end_matches('='))
-                    .ok()?;
-                let claims: Value = serde_json::from_slice(&bytes).ok()?;
+                let claims = crate::agent_usage::jwt_payload(access_token)?;
                 let subject = claims.get("sub")?.as_str()?.trim();
                 if subject.is_empty() {
                     return None;
@@ -430,7 +426,7 @@ fn parse_timestamp(value: &Value) -> Option<DateTime<Utc>> {
 /// yet. Rendering it as an error would tell a user who answered "don't allow"
 /// that the app malfunctioned.
 pub(crate) const GROK_BOT_KEYCHAIN_CONSENT_REQUIRED: &str =
-    "TokenBar needs your permission to read the Grok Bot login from Keychain.";
+    "Syrtis needs your permission to read the Grok Bot login from Keychain.";
 
 fn load_credentials() -> Result<Option<GrokBotCredentials>, String> {
     #[cfg(target_os = "macos")]
@@ -1420,6 +1416,57 @@ mod tests {
             access_token: format!("header.{payload}.{signature}"),
             team_id,
         }
+    }
+
+    fn raw_desktop_token(access_token: String) -> GrokBotCredentials {
+        GrokBotCredentials::Desktop {
+            access_token,
+            team_id: None,
+        }
+    }
+
+    #[test]
+    fn history_owner_requires_a_compact_three_segment_jwt() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::json!({"sub": "user-a"}).to_string());
+        assert_eq!(
+            raw_desktop_token(format!("header.{payload}.signature")).history_owner(),
+            Some(r#"["user-a",null]"#.to_string()),
+            "control: the same claims in a three-segment token must yield an owner"
+        );
+        for malformed in [
+            format!("header.{payload}"),
+            format!("header.{payload}.signature.extra"),
+            format!("header.{payload}."),
+            format!(".{payload}.signature"),
+        ] {
+            assert!(
+                raw_desktop_token(malformed.clone())
+                    .history_owner()
+                    .is_none(),
+                "{malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn history_owner_is_the_literal_subject_and_team_tuple() {
+        assert_eq!(
+            desktop_token("user-a", "credential-a", None).history_owner(),
+            Some(r#"["user-a",null]"#.to_string())
+        );
+    }
+
+    #[test]
+    fn history_owner_decodes_url_safe_payload_alphabet() {
+        let subject = "~~~???>>>";
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::json!({"sub": subject}).to_string());
+        assert!(payload.contains('-') && payload.contains('_'), "{payload}");
+        assert_eq!(
+            desktop_token(subject, "credential-a", None).history_owner(),
+            Some(serde_json::json!([subject, null]).to_string())
+        );
     }
 
     #[test]

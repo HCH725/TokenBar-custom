@@ -1,27 +1,41 @@
+---
+status: active
+id: vendor-readme
+kind: reference
+scope: repository
+read_when: advancing or auditing the vendor/tokscale-core consumer pin
+last_verified: 2026-10-01
+sources: [".gitmodules", "vendor/tokscale-core", "docs/knowledge/vendor-tokscale.md"]
+---
+
 # Shared Rust core pin
 
-TokenBar consumes the private canonical
+The private Syrtis build consumes
 [`HCH725/tokscale-core-custom`](https://github.com/HCH725/tokscale-core-custom)
-repository as a Git submodule; that repository tracks the public `Nanako0129/tokscale-core` baseline. Consumer integration rules are documented in
+as its canonical Git submodule. That private engine is rebased onto the public
+[`Nanako0129/tokscale-core`](https://github.com/Nanako0129/tokscale-core)
+baseline; consumer integration rules are documented in
 [`docs/knowledge/vendor-tokscale.md`](../docs/knowledge/vendor-tokscale.md).
 
 | Field | Value |
 |---|---|
 | Path | `vendor/tokscale-core` |
 | Repository | `https://github.com/HCH725/tokscale-core-custom.git` |
-| Reviewed pin | `dad446ddea70a6c751c1eb338c5c03112df83af6` |
-| Upstream and local-patch ledger | Immutable [`UPSTREAM.md`](https://github.com/HCH725/tokscale-core-custom/blob/dad446ddea70a6c751c1eb338c5c03112df83af6/UPSTREAM.md) plus private contract [`CUSTOM.md`](https://github.com/HCH725/tokscale-core-custom/blob/dad446ddea70a6c751c1eb338c5c03112df83af6/CUSTOM.md) |
+| Reviewed pin | `ad24f3c06b3c08893323e059bbae50ebbdde1441` |
+| Public upstream baseline | `319ffa8ca75f6cd2bfaf96ae0d295a8fa618ec2c` |
+| Upstream ledger | Immutable public [`UPSTREAM.md` at `319ffa8`](https://github.com/Nanako0129/tokscale-core/blob/319ffa8ca75f6cd2bfaf96ae0d295a8fa618ec2c/UPSTREAM.md) |
+| Private downstream contract | Engine [`CUSTOM.md`](https://github.com/HCH725/tokscale-core-custom/blob/main/CUSTOM.md) |
 
 ## Ownership
 
-The shared repository owns parsers, scanning, cache behavior, pricing, and
-aggregation. TokenBar owns the gitlink, root `Cargo.lock`,
+The private shared-engine repository owns parsers, scanning, cache behavior,
+pricing, and aggregation. Syrtis owns the gitlink, root `Cargo.lock`,
 `crates/tb_core_ffi`, `Sources/CTB/include/ctb.h`, Swift code, and application
 build wiring.
 
-Do not edit shared Rust source inside the TokenBar submodule. Land and verify
-engine changes in `tokscale-core`, then advance this pin to the reviewed engine
-commit and run the TokenBar consumer gates.
+Do not edit shared Rust source from the consumer change. Land and independently
+verify engine changes in `HCH725/tokscale-core-custom`, then advance this pin to
+the reviewed private engine commit and run the Syrtis consumer gates.
 
 ## Checkout
 

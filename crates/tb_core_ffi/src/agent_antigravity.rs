@@ -26,8 +26,6 @@ use crate::agent_usage::{
     request_after_verified_binding, AgentIdentity, ProviderCacheBinding, ProviderFetchFailure,
     ResponseReadFailure, TransportErrorFacts, TransportPhase, UsageWindow,
 };
-#[cfg(any(windows, test))]
-use base64::Engine;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{json, value::RawValue, Value};
@@ -35,10 +33,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// Marker error for "none of the three routes has a credential to use". The
+/// local IDE route needs a running language server, the `agy` route needs the
+/// CLI's own login, and both are tried before this failure can be returned, so
+/// reaching it means nothing is set up. `agent_usage::fetch_antigravity` pairs
+/// it with `source == "unconfigured"` — see `required_card_source` there.
+pub(crate) const ANTIGRAVITY_UNCONFIGURED_ERROR: &str =
+    "Antigravity is not logged in. Re-login in Antigravity.";
 
 const LANG_SERVICE: &str = "/exa.language_server_pb.LanguageServerService/GetUserStatus";
 const CODE_ASSIST_BASE: &str = "https://cloudcode-pa.googleapis.com/v1internal";
@@ -137,14 +141,33 @@ pub(crate) async fn fetch(now: DateTime<Utc>) -> Result<Fetched, ProviderFetchFa
         |context| fetch_oauth_secondary(context, now),
     )
     .await;
+    with_agy_fallback(primary, || fetch_agy_cli(now)).await
+}
+
+/// The `agy` route's arbitration, separated from the route itself so the
+/// property that decides the card's `source` can be tested without a CLI, a
+/// login shell or the network.
+///
+/// That property is the `Err(_)` arm: when the CLI cannot answer, the caller
+/// sees the ORIGINAL failure rather than the CLI's. It is what carries
+/// `ANTIGRAVITY_UNCONFIGURED_ERROR` out of `fetch` on a machine where nothing is
+/// set up, and it is unreachable on a machine that has Antigravity — there the
+/// CLI answers and the card is configured, which is why #345's Antigravity half
+/// is pinned here instead of by running the app.
+async fn with_agy_fallback<Agy, AgyFuture>(
+    primary: Result<Fetched, ProviderFetchFailure>,
+    agy: Agy,
+) -> Result<Fetched, ProviderFetchFailure>
+where
+    Agy: FnOnce() -> AgyFuture,
+    AgyFuture: std::future::Future<Output = Result<Fetched, ProviderFetchFailure>>,
+{
     match primary {
         Ok(fetched) => Ok(fetched),
-        Err(primary_failure) if should_try_agy_fallback(&primary_failure) => {
-            match fetch_agy_cli(now).await {
-                Ok(fetched) => Ok(fetched),
-                Err(_) => Err(primary_failure),
-            }
-        }
+        Err(primary_failure) if should_try_agy_fallback(&primary_failure) => match agy().await {
+            Ok(fetched) => Ok(fetched),
+            Err(_) => Err(primary_failure),
+        },
         Err(primary_failure) => Err(primary_failure),
     }
 }
@@ -196,34 +219,199 @@ async fn oauth_endpoint_resolves() -> bool {
 /// to the browser. Anything that manages the child after spawning it is subject
 /// to the same freeze; only not spawning it is not.
 ///
-/// Taking the runner as a parameter is what lets a test assert the child is
-/// never spawned, rather than inferring it from the returned error.
+/// The same freeze applies to the logged-out case below: with `agy` signed out,
+/// `agy --print /usage --output-format json --print-timeout 30s </dev/null` was
+/// measured on macOS to open a browser tab on Google's OAuth consent page and
+/// wait there. That is exactly the command this route runs unattended, so the
+/// login check also has to happen before the spawn, not after it.
+///
+/// Taking the runner, the login marker and the latch as parameters is what
+/// lets a test assert the child is never spawned, rather than inferring it
+/// from the returned error.
+///
+/// The latch trade-off: once a real attempt has spawned `agy` and failed, the
+/// route stays off for as long as the login marker is unchanged. A transient
+/// failure after a real spawn therefore disables the `agy` route until the
+/// Keychain item is rewritten (a re-login) or the app restarts, and meanwhile
+/// the card shows the primary route's error, because `with_agy_fallback`
+/// discards this route's failure. Expiring the latch on a timer is
+/// deliberately not implemented: a spawned attempt that failed may be one that
+/// opened the browser, and the failure seen here does not say which, so a
+/// timed retry could repeat it every period.
 async fn fetch_agy_cli_gated<Run, RunFuture>(
     now: DateTime<Utc>,
     endpoint_resolves: bool,
+    marker: Option<String>,
+    latch: &std::sync::Mutex<AgyLatch>,
     run: Run,
 ) -> Result<Fetched, ProviderFetchFailure>
 where
     Run: FnOnce(DateTime<Utc>) -> RunFuture,
-    RunFuture: std::future::Future<Output = Result<Fetched, ProviderFetchFailure>>,
+    RunFuture: std::future::Future<Output = Result<Fetched, AgyRunError>>,
 {
     if !endpoint_resolves {
         return Err(ProviderFetchFailure::terminal(
             "Antigravity quota is unavailable while the network is unreachable.",
         ));
     }
-    run(now).await
+    let Some(marker) = marker else {
+        return Err(ProviderFetchFailure::terminal(
+            "Antigravity CLI is not signed in.",
+        ));
+    };
+    {
+        // Scoped so the guard is released before the await below: polls can
+        // overlap (there is no per-provider single-flight upstream), and a
+        // std mutex held across an await would block the other poll's thread.
+        let mut state = lock_agy_latch(latch);
+        match &*state {
+            AgyLatch::InFlight => {
+                return Err(ProviderFetchFailure::terminal(
+                    "Antigravity CLI usage is already running.",
+                ));
+            }
+            AgyLatch::Failed(failed) if *failed == marker => {
+                return Err(ProviderFetchFailure::terminal(
+                    "Antigravity CLI usage is paused after a failed attempt.",
+                ));
+            }
+            AgyLatch::Idle | AgyLatch::Failed(_) => *state = AgyLatch::InFlight,
+        }
+    }
+    // Created with no await between it and the InFlight write, so a panic in
+    // `run` or a drop of this future mid-flight still leaves the latch Idle.
+    let mut release = AgyLatchRelease {
+        latch,
+        next: AgyLatch::Idle,
+    };
+    match run(now).await {
+        Ok(fetched) => Ok(fetched),
+        Err(AgyRunError { failure, spawned }) => {
+            if spawned {
+                release.next = AgyLatch::Failed(marker);
+            }
+            Err(failure)
+        }
+    }
+}
+
+/// Whether the `agy` route may spawn the CLI. `Failed` carries the login
+/// marker that was current when a spawned attempt failed; a different marker
+/// (the Keychain item was rewritten by a re-login) re-arms the route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AgyLatch {
+    Idle,
+    InFlight,
+    Failed(String),
+}
+
+#[cfg(target_os = "macos")]
+static AGY_LATCH: std::sync::Mutex<AgyLatch> = std::sync::Mutex::new(AgyLatch::Idle);
+
+/// A failed `agy` run, with whether any CLI process was actually attempted.
+/// Only an attempted run may latch the route off; "no CLI installed" must not.
+#[derive(Debug)]
+struct AgyRunError {
+    failure: ProviderFetchFailure,
+    spawned: bool,
+}
+
+/// Writes `next` into the latch when dropped, so `InFlight` cannot outlive the
+/// attempt that set it, whether that attempt returns, panics or is cancelled.
+struct AgyLatchRelease<'a> {
+    latch: &'a std::sync::Mutex<AgyLatch>,
+    next: AgyLatch,
+}
+
+impl Drop for AgyLatchRelease<'_> {
+    fn drop(&mut self) {
+        let next = std::mem::replace(&mut self.next, AgyLatch::Idle);
+        *lock_agy_latch(self.latch) = next;
+    }
+}
+
+/// The latch holds no invariant a panic could break halfway, so a poisoned
+/// lock is recovered rather than propagated; propagating would panic inside
+/// `AgyLatchRelease::drop` during an unwind.
+fn lock_agy_latch(latch: &std::sync::Mutex<AgyLatch>) -> std::sync::MutexGuard<'_, AgyLatch> {
+    latch
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// The Keychain lookup that answers "is `agy` signed in" — the login keychain
+/// generic-password item `gemini` / `antigravity`. Measured on macOS: exit 0
+/// while signed in, exit 44 after `agy`'s `/logout`, with no access prompt.
+///
+/// Attributes only. Neither `-w` nor `-g` is passed, so the secret is never
+/// requested; a test pins this exact slice so neither can be added silently.
+#[cfg(any(target_os = "macos", test))]
+const AGY_KEYCHAIN_QUERY: &[&str] = &["find-generic-password", "-s", "gemini", "-a", "antigravity"];
+
+/// The value of the `"mdat"<timedate>=` attribute line (modification date) in
+/// `security find-generic-password` output, trimmed. A re-login rewrites the
+/// item, which is what lets it re-arm a latched-off route.
+#[cfg(any(target_os = "macos", test))]
+fn parse_keychain_mdat(stdout: &str) -> Option<String> {
+    stdout.lines().find_map(|line| {
+        let value = line
+            .trim_start()
+            .strip_prefix("\"mdat\"<timedate>=")?
+            .trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// `Some(marker)` when `agy`'s Keychain login item exists, `None` otherwise
+/// (exit 44, any other exit, spawn failure or timeout — all read as "do not
+/// spawn `agy`"). The marker is the item's modification date, or the fixed
+/// `"present"` when that cannot be parsed, so the latch still applies; with the
+/// sentinel only an app restart re-arms a latched route.
+///
+/// stdout is parsed and dropped here, never logged.
+#[cfg(target_os = "macos")]
+async fn agy_login_marker() -> Option<String> {
+    let future = tokio::process::Command::new("/usr/bin/security")
+        .args(AGY_KEYCHAIN_QUERY)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(std::time::Duration::from_secs(3), future)
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let marker = parse_keychain_mdat(&String::from_utf8_lossy(&output.stdout));
+    Some(marker.unwrap_or_else(|| "present".to_string()))
 }
 
 #[cfg(target_os = "macos")]
 async fn fetch_agy_cli(now: DateTime<Utc>) -> Result<Fetched, ProviderFetchFailure> {
     let endpoint_resolves = oauth_endpoint_resolves().await;
-    fetch_agy_cli_gated(now, endpoint_resolves, run_agy_cli_candidates).await
+    // The Keychain is not consulted when the gate has already closed.
+    let marker = if endpoint_resolves {
+        agy_login_marker().await
+    } else {
+        None
+    };
+    fetch_agy_cli_gated(
+        now,
+        endpoint_resolves,
+        marker,
+        &AGY_LATCH,
+        run_agy_cli_candidates,
+    )
+    .await
 }
 
+/// `spawned` is false only when there was no candidate to run; any call into
+/// `fetch_agy_cli_from` counts as an attempt.
 #[cfg(target_os = "macos")]
-async fn run_agy_cli_candidates(now: DateTime<Utc>) -> Result<Fetched, ProviderFetchFailure> {
-    let candidates = agy_cli_artifact_candidates().await;
+async fn run_agy_cli_candidates(now: DateTime<Utc>) -> Result<Fetched, AgyRunError> {
+    let candidates = agy_cli_artifact_candidates(true).await;
     let mut last_failure = None;
     for executable in candidates {
         match fetch_agy_cli_from(&executable, now).await {
@@ -231,8 +419,16 @@ async fn run_agy_cli_candidates(now: DateTime<Utc>) -> Result<Fetched, ProviderF
             Err(failure) => last_failure = Some(failure),
         }
     }
-    Err(last_failure
-        .unwrap_or_else(|| ProviderFetchFailure::terminal("Antigravity CLI was not found.")))
+    Err(match last_failure {
+        Some(failure) => AgyRunError {
+            failure,
+            spawned: true,
+        },
+        None => AgyRunError {
+            failure: ProviderFetchFailure::terminal("Antigravity CLI was not found."),
+            spawned: false,
+        },
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -363,14 +559,12 @@ fn local_api_candidates(processes: Vec<(ProcInfo, Vec<u16>)>) -> Vec<(u16, Strin
     candidates
 }
 
-#[cfg(not(windows))]
 fn discover_local_ide() -> Result<Vec<(ProcInfo, Vec<u16>)>, String> {
     let proc = detect_process()?;
     let ports = listening_ports(proc.pid)?;
     Ok(vec![(proc, ports)])
 }
 
-#[cfg(not(windows))]
 fn detect_process() -> Result<ProcInfo, String> {
     let output = Command::new("/bin/ps")
         .args(["-ax", "-o", "pid=,command="])
@@ -428,7 +622,6 @@ fn extract_flag(cmd: &str, flag: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-#[cfg(not(windows))]
 fn listening_ports(pid: i32) -> Result<Vec<u16>, String> {
     let lsof = ["/usr/sbin/lsof", "/usr/bin/lsof"]
         .into_iter()
@@ -453,192 +646,6 @@ fn parse_listen_port(line: &str) -> Option<u16> {
     let before = line[..idx].trim_end();
     let colon = before.rfind(':')?;
     before[colon + 1..].trim().parse().ok()
-}
-
-#[cfg(any(windows, test))]
-const WINDOWS_DISCOVERY_PREFIX: &str = "ANTIGRAVITY_V1";
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-#[cfg(any(windows, test))]
-const WINDOWS_DISCOVERY_SCRIPT: &str = r#"
-$ErrorActionPreference = 'Stop'
-try {
-    [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-    $processes = @(Get-CimInstance -ClassName Win32_Process -Filter "Name LIKE 'language_server%.exe'")
-    if ($processes.Count -eq 0) {
-        [Console]::Out.WriteLine("ANTIGRAVITY_V1`tN")
-        exit 0
-    }
-
-    $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop)
-    foreach ($process in $processes) {
-        $commandLine = [string]$process.CommandLine
-        $encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($commandLine))
-        $ports = @(
-            $listeners |
-                Where-Object { $_.OwningProcess -eq [uint32]$process.ProcessId } |
-                ForEach-Object { [uint16]$_.LocalPort } |
-                Sort-Object -Unique
-        )
-        [Console]::Out.WriteLine(
-            "ANTIGRAVITY_V1`tP`t$($process.ProcessId)`t$encoded`t$($ports -join ',')"
-        )
-    }
-} catch {
-    exit 1
-}
-exit 0
-"#;
-
-#[cfg(any(windows, test))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WindowsDiscoveryError {
-    ProcessNotFound,
-    TokenMissing,
-    PortsMissing,
-    PowerShellFailed,
-    MalformedOutput,
-}
-
-#[cfg(any(windows, test))]
-impl WindowsDiscoveryError {
-    fn message(self) -> &'static str {
-        match self {
-            Self::ProcessNotFound => "Antigravity is not running",
-            Self::TokenMissing => "Antigravity is running but no CSRF token was found",
-            Self::PortsMissing => "no listening ports for Antigravity",
-            Self::PowerShellFailed => "Antigravity PowerShell discovery failed",
-            Self::MalformedOutput => "malformed Antigravity PowerShell discovery output",
-        }
-    }
-}
-
-#[cfg(windows)]
-fn discover_local_ide() -> Result<Vec<(ProcInfo, Vec<u16>)>, String> {
-    let system_root = std::env::var_os("SystemRoot").ok_or_else(|| {
-        WindowsDiscoveryError::PowerShellFailed
-            .message()
-            .to_string()
-    })?;
-    let powershell = PathBuf::from(system_root)
-        .join("System32")
-        .join("WindowsPowerShell")
-        .join("v1.0")
-        .join("powershell.exe");
-    let output = Command::new(powershell)
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            WINDOWS_DISCOVERY_SCRIPT,
-        ])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|_| {
-            WindowsDiscoveryError::PowerShellFailed
-                .message()
-                .to_string()
-        })?;
-    if !output.status.success() {
-        return Err(WindowsDiscoveryError::PowerShellFailed
-            .message()
-            .to_string());
-    }
-    let stdout = std::str::from_utf8(&output.stdout)
-        .map_err(|_| WindowsDiscoveryError::MalformedOutput.message().to_string())?;
-    parse_windows_discovery(stdout).map_err(|error| error.message().to_string())
-}
-
-#[cfg(any(windows, test))]
-fn parse_windows_discovery(
-    stdout: &str,
-) -> Result<Vec<(ProcInfo, Vec<u16>)>, WindowsDiscoveryError> {
-    let mut processes = Vec::new();
-    let mut saw_valid_record = false;
-    let mut saw_antigravity = false;
-    let mut saw_csrf = false;
-
-    for line in stdout.lines() {
-        let fields: Vec<&str> = line.trim_end_matches('\r').split('\t').collect();
-        match fields.as_slice() {
-            [prefix, "N"] if *prefix == WINDOWS_DISCOVERY_PREFIX => {
-                saw_valid_record = true;
-            }
-            [prefix, "P", pid, encoded_cmd, port_field] if *prefix == WINDOWS_DISCOVERY_PREFIX => {
-                let Ok(pid) = pid.parse::<i32>() else {
-                    continue;
-                };
-                let Some(ports) = parse_windows_ports(port_field) else {
-                    continue;
-                };
-                let Ok(command_bytes) =
-                    base64::engine::general_purpose::STANDARD.decode(encoded_cmd)
-                else {
-                    continue;
-                };
-                let Ok(cmd) = String::from_utf8(command_bytes) else {
-                    continue;
-                };
-                if cmd.is_empty() {
-                    continue;
-                }
-                saw_valid_record = true;
-                let lower = cmd.to_lowercase();
-                if !is_language_server(&lower) || !is_antigravity(&lower) {
-                    continue;
-                }
-                saw_antigravity = true;
-                let Some(csrf) = extract_flag(&cmd, "--csrf_token") else {
-                    continue;
-                };
-                saw_csrf = true;
-                if ports.is_empty() {
-                    continue;
-                }
-                processes.push((
-                    ProcInfo {
-                        pid,
-                        csrf_token: csrf,
-                        extension_port: extract_flag(&cmd, "--extension_server_port")
-                            .and_then(|value| value.parse().ok()),
-                        extension_csrf: extract_flag(&cmd, "--extension_server_csrf_token"),
-                    },
-                    ports,
-                ));
-            }
-            _ => {}
-        }
-    }
-
-    if !processes.is_empty() {
-        Ok(processes)
-    } else if saw_csrf {
-        Err(WindowsDiscoveryError::PortsMissing)
-    } else if saw_antigravity {
-        Err(WindowsDiscoveryError::TokenMissing)
-    } else if saw_valid_record {
-        Err(WindowsDiscoveryError::ProcessNotFound)
-    } else {
-        Err(WindowsDiscoveryError::MalformedOutput)
-    }
-}
-
-#[cfg(any(windows, test))]
-fn parse_windows_ports(field: &str) -> Option<Vec<u16>> {
-    if field.is_empty() {
-        return Some(Vec::new());
-    }
-    let mut ports = BTreeSet::new();
-    for value in field.split(',') {
-        let port = value.parse::<u16>().ok()?;
-        if port == 0 {
-            return None;
-        }
-        ports.insert(port);
-    }
-    Some(ports.into_iter().collect())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1057,9 +1064,7 @@ async fn prepare_remote_context(now: DateTime<Utc>) -> Result<RemoteContext, Pro
         .ok_or_else(|| {
             ProviderFetchFailure::terminal("Antigravity credential location could not be resolved.")
         })?;
-    let creds = load_remote_credentials(&creds_path).map_err(|_| {
-        ProviderFetchFailure::terminal("Antigravity is not logged in. Re-login in Antigravity.")
-    })?;
+    let creds = remote_credentials_or_unconfigured(&creds_path)?;
     let verified = if remote_credentials_need_refresh(&creds, now) {
         refresh_access_token(&creds_path, now).await.map(
             |(_, access_token, account_scope, cache_binding)| {
@@ -1136,10 +1141,51 @@ fn remote_identity(plan: Option<String>) -> AgentIdentity {
     AgentIdentity { email: None, plan }
 }
 
-fn load_remote_credentials(path: &Path) -> Result<Value, String> {
-    let raw = std::fs::read_to_string(path)
-        .map_err(|_| "Antigravity not logged in (no ~/.gemini/oauth_creds.json)".to_string())?;
-    serde_json::from_str(&raw).map_err(|e| format!("decode oauth_creds.json: {e}"))
+/// Why the shared Google credential could not be loaded.
+///
+/// The distinction is behaviour, not wording. Only a genuinely absent file means
+/// "nothing is configured", and only that verdict may take the card out of tab
+/// navigation (#345). A file that exists but cannot be read or parsed belongs to
+/// a configured account with a broken credential: it has to stay visible and say
+/// so, or a permission problem and a corrupt JSON both present as "you never set
+/// this up" while the card silently leaves the tab bar.
+#[derive(Debug, PartialEq, Eq)]
+enum RemoteCredentialError {
+    Absent,
+    Unreadable,
+}
+
+/// A credential that exists but cannot be used. Distinct from
+/// `ANTIGRAVITY_UNCONFIGURED_ERROR` so `required_card_source` leaves it at
+/// `oauth`, which keeps the card and its tab.
+const ANTIGRAVITY_UNREADABLE_ERROR: &str =
+    "Antigravity credentials could not be read. Re-login in Antigravity.";
+
+/// The credential step of `prepare_remote_context`, split out so the pairing of
+/// "no credential at all" with `ANTIGRAVITY_UNCONFIGURED_ERROR` is reachable
+/// from a test without a Gemini home, a running IDE or the network. That pairing
+/// is what keeps an Antigravity card that has never been set up out of tab
+/// navigation, so it is behaviour, not a message (#345).
+fn remote_credentials_or_unconfigured(path: &Path) -> Result<Value, ProviderFetchFailure> {
+    load_remote_credentials(path).map_err(|error| match error {
+        RemoteCredentialError::Absent => {
+            ProviderFetchFailure::terminal(ANTIGRAVITY_UNCONFIGURED_ERROR)
+        }
+        RemoteCredentialError::Unreadable => {
+            ProviderFetchFailure::terminal(ANTIGRAVITY_UNREADABLE_ERROR)
+        }
+    })
+}
+
+fn load_remote_credentials(path: &Path) -> Result<Value, RemoteCredentialError> {
+    let raw = std::fs::read_to_string(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            RemoteCredentialError::Absent
+        } else {
+            RemoteCredentialError::Unreadable
+        }
+    })?;
+    serde_json::from_str(&raw).map_err(|_| RemoteCredentialError::Unreadable)
 }
 
 fn remote_access_token(creds: &Value) -> Result<String, String> {
@@ -1318,7 +1364,7 @@ where
         })?
         .to_string();
 
-    // The provider refresh lock serializes TokenBar writers, but the credential
+    // The provider refresh lock serializes Syrtis writers, but the credential
     // file has no cross-process compare-and-swap. Re-reading closes the network
     // wait race; an external writer can still race this check and atomic rename.
     let mut current_creds = load_remote_credentials(creds_path).map_err(|_| {
@@ -1845,7 +1891,7 @@ async fn discover_client_from_app() -> Option<(String, String)> {
     if let Some(client) = discover_client_from_artifacts(client_artifact_candidates()) {
         return Some(client);
     }
-    discover_client_from_artifacts(agy_cli_artifact_candidates().await)
+    discover_client_from_artifacts(agy_cli_artifact_candidates(false).await)
 }
 
 fn discover_client_from_artifacts<I>(paths: I) -> Option<(String, String)>
@@ -1884,24 +1930,64 @@ fn client_artifact_candidates() -> Vec<PathBuf> {
         .collect()
 }
 
+/// `throttle_login_shell` is true only for the quota poll. Without `agy` an
+/// empty result would start a login shell on every quota refresh (#353), so
+/// that caller is rate-limited by `AGY_LOGIN_SHELL_COOLDOWN`. OAuth client
+/// discovery must not be: `resolve_oauth_client` stores its first answer for
+/// the life of the process, so a cooldown-suppressed empty list would become a
+/// permanent `None`.
 #[cfg(target_os = "macos")]
-async fn agy_cli_artifact_candidates() -> Vec<PathBuf> {
+async fn agy_cli_artifact_candidates(throttle_login_shell: bool) -> Vec<PathBuf> {
     static CACHE: tokio::sync::OnceCell<Vec<PathBuf>> = tokio::sync::OnceCell::const_new();
-    CACHE
-        .get_or_init(|| async {
-            // PATH is the normal resolution rule. Only start a login shell
-            // when the GUI process did not inherit a usable PATH entry.
-            if let Some(path) = executable_from_path(std::env::var_os("PATH").as_deref(), "agy") {
-                return vec![path];
-            }
+    static LAST_SHELL_DISCOVERY: std::sync::Mutex<Option<std::time::Instant>> =
+        std::sync::Mutex::new(None);
+    if let Some(cached) = CACHE.get() {
+        return cached.clone();
+    }
+
+    // PATH is the normal resolution rule. Only start a login shell when the
+    // GUI process did not inherit a usable PATH entry. Do not cache an empty
+    // result: the CLI may be installed after Syrtis has started.
+    let candidates =
+        if let Some(path) = executable_from_path(std::env::var_os("PATH").as_deref(), "agy") {
+            vec![path]
+        } else if !throttle_login_shell
+            || claim_agy_login_shell_discovery(&LAST_SHELL_DISCOVERY, std::time::Instant::now())
+        {
             agy_cli_artifact_candidates_from(None, discover_agy_from_login_shell().await)
-        })
-        .await
-        .clone()
+        } else {
+            Vec::new()
+        };
+    cache_non_empty_agy_candidates(&CACHE, candidates)
+}
+
+/// How long one polled login-shell discovery suppresses the next. It bounds
+/// how late an `agy` installed after launch, and reachable only through the
+/// login shell, is found by the poll. A shell that timed out also holds the
+/// slot: a slow shell is the costly case this limits. The monotonic clock
+/// pauses across sleep, which only lengthens the wait.
+#[cfg(any(target_os = "macos", test))]
+const AGY_LOGIN_SHELL_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Whether a polled login-shell discovery may start now. Claims the slot
+/// before the shell runs, so overlapping callers start one shell, not one each.
+#[cfg(any(target_os = "macos", test))]
+fn claim_agy_login_shell_discovery(
+    last: &std::sync::Mutex<Option<std::time::Instant>>,
+    now: std::time::Instant,
+) -> bool {
+    let mut last = last
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if last.is_some_and(|at| now.saturating_duration_since(at) < AGY_LOGIN_SHELL_COOLDOWN) {
+        return false;
+    }
+    *last = Some(now);
+    true
 }
 
 #[cfg(not(target_os = "macos"))]
-async fn agy_cli_artifact_candidates() -> Vec<PathBuf> {
+async fn agy_cli_artifact_candidates(_throttle_login_shell: bool) -> Vec<PathBuf> {
     Vec::new()
 }
 
@@ -1919,6 +2005,19 @@ fn agy_cli_artifact_candidates_from(
         }
     }
     candidates
+}
+
+fn cache_non_empty_agy_candidates(
+    cache: &tokio::sync::OnceCell<Vec<PathBuf>>,
+    candidates: Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    if let Some(cached) = cache.get() {
+        return cached.clone();
+    }
+    if !candidates.is_empty() {
+        let _ = cache.set(candidates.clone());
+    }
+    cache.get().cloned().unwrap_or(candidates)
 }
 
 fn executable_from_path(path_env: Option<&OsStr>, name: &str) -> Option<PathBuf> {
@@ -2159,128 +2258,6 @@ mod tests {
         assert_eq!(parse_listen_port("... (ESTABLISHED)"), None);
     }
 
-    fn windows_process_fixture(pid: i32, command: &str, ports: &str) -> String {
-        let encoded = base64::engine::general_purpose::STANDARD.encode(command);
-        format!("{WINDOWS_DISCOVERY_PREFIX}\tP\t{pid}\t{encoded}\t{ports}")
-    }
-
-    fn windows_discovery_error(stdout: &str) -> WindowsDiscoveryError {
-        match parse_windows_discovery(stdout) {
-            Ok(_) => panic!("Windows discovery fixture unexpectedly succeeded"),
-            Err(error) => error,
-        }
-    }
-
-    #[test]
-    fn windows_discovery_queries_language_server_executable_family() {
-        assert!(WINDOWS_DISCOVERY_SCRIPT.contains(
-            r#"Get-CimInstance -ClassName Win32_Process -Filter "Name LIKE 'language_server%.exe'""#
-        ));
-    }
-
-    #[test]
-    fn windows_discovery_preserves_per_process_candidate_binding() {
-        let first_csrf = "first-primary-secret";
-        let first_extension_csrf = "first-extension-secret";
-        let second_csrf = "second-primary-secret";
-        let first = windows_process_fixture(
-            1001,
-            &format!(
-                r#""C:\Program Files\Antigravity\language_server_windows_x64.exe" --app_data_dir="C:\Users\me\AppData\Roaming\Antigravity" --csrf_token={first_csrf} --extension_server_port=41999 --extension_server_csrf_token={first_extension_csrf}"#
-            ),
-            "41002,41001,41002",
-        );
-        let ignored = windows_process_fixture(
-            1009,
-            r#"C:\Other\language_server.exe --csrf_token=decoy-secret"#,
-            "49999",
-        );
-        let second = windows_process_fixture(
-            1002,
-            &format!(
-                r#"C:\Antigravity\language_server.exe --app_data_dir antigravity --csrf_token={second_csrf}"#
-            ),
-            "42000",
-        );
-        let fixture = format!(
-            "garbage\n{first}\n{ignored}\n{WINDOWS_DISCOVERY_PREFIX}\tP\tnot-a-pid\tnot-base64\t80\n{second}\r\n"
-        );
-
-        let processes = match parse_windows_discovery(&fixture) {
-            Ok(processes) => processes,
-            Err(_) => panic!("valid Windows discovery fixture was rejected"),
-        };
-        assert_eq!(processes.len(), 2);
-        assert_eq!(processes[0].0.pid, 1001);
-        assert_eq!(processes[0].1.as_slice(), &[41001, 41002]);
-        assert_eq!(processes[1].0.pid, 1002);
-        assert_eq!(processes[1].1.as_slice(), &[42000]);
-
-        assert_eq!(
-            local_api_candidates(processes),
-            vec![
-                (41001, first_csrf.to_string()),
-                (41002, first_csrf.to_string()),
-                (41999, first_extension_csrf.to_string()),
-                (41999, first_csrf.to_string()),
-                (42000, second_csrf.to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn windows_discovery_rejects_malformed_rows_without_exposing_secrets() {
-        let sentinel = "sentinel-secret-that-must-not-leak";
-        let command = format!(
-            r#"C:\Antigravity\language_server.exe --app_data_dir antigravity --csrf_token={sentinel}"#
-        );
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&command);
-        for malformed in [
-            "garbage".to_string(),
-            format!("{WINDOWS_DISCOVERY_PREFIX}\tP\tnot-a-pid\t{encoded}\t54321"),
-            format!("{WINDOWS_DISCOVERY_PREFIX}\tP\t4242\tnot-base64\t54321"),
-            windows_process_fixture(4242, &command, "not-a-port"),
-            windows_process_fixture(4242, &command, "0"),
-            windows_process_fixture(4242, &command, "65536"),
-        ] {
-            assert_eq!(
-                windows_discovery_error(&malformed),
-                WindowsDiscoveryError::MalformedOutput
-            );
-        }
-
-        assert_eq!(
-            windows_discovery_error(&format!("{WINDOWS_DISCOVERY_PREFIX}\tN\n")),
-            WindowsDiscoveryError::ProcessNotFound
-        );
-        assert_eq!(
-            windows_discovery_error(&windows_process_fixture(
-                4242,
-                r#"C:\Other\language_server.exe --csrf_token=decoy-secret"#,
-                "54321",
-            )),
-            WindowsDiscoveryError::ProcessNotFound
-        );
-        assert_eq!(
-            windows_discovery_error(&windows_process_fixture(
-                4242,
-                r#"C:\Antigravity\language_server.exe --app_data_dir antigravity"#,
-                "54321",
-            )),
-            WindowsDiscoveryError::TokenMissing
-        );
-
-        let error = windows_discovery_error(&windows_process_fixture(4242, &command, ""));
-        assert_eq!(error, WindowsDiscoveryError::PortsMissing);
-        let display = error.message();
-        let debug = format!("{error:?}");
-        assert!(!display.contains(sentinel));
-        assert!(!debug.contains(sentinel));
-        assert!(!WindowsDiscoveryError::PowerShellFailed
-            .message()
-            .contains(sentinel));
-    }
-
     #[test]
     fn scans_and_pairs_oauth_client_from_bytes() {
         let blob = b"junk\x00123-abcDEF_g.apps.googleusercontent.com\x00\x00GOCSPX-abcdefghijklmnopqrstuvwxyz12\x00tail";
@@ -2470,6 +2447,66 @@ mod tests {
             ),
             vec![shell_candidate]
         );
+    }
+
+    /// An **absent** credential file must report the marker verbatim: the
+    /// snapshot's `source` is decided by comparing against it
+    /// (`agent_usage::required_card_source`), so a message edited here and not
+    /// there silently restores the phantom tab this pairing removes.
+    ///
+    /// Absent, not unreadable — the two are now different verdicts.
+    /// `RemoteCredentialError::Unreadable` deliberately does NOT reach this
+    /// marker, and `malformed_remote_credentials_are_unreadable_not_absent`
+    /// below is the assertion that keeps it out. This wording predated that
+    /// split and described the behaviour the split removed.
+    #[test]
+    fn absent_remote_credentials_report_the_unconfigured_marker() {
+        let missing = std::env::temp_dir()
+            .join("tokenbar-antigravity-unconfigured-probe")
+            .join("oauth_creds.json");
+        assert!(!missing.exists(), "the probe path must not exist");
+        let failure = remote_credentials_or_unconfigured(&missing).unwrap_err();
+        assert!(
+            matches!(
+                failure,
+                ProviderFetchFailure::Terminal { ref display }
+                    if display == ANTIGRAVITY_UNCONFIGURED_ERROR
+            ),
+            "absent credentials must carry the unconfigured marker, got {failure:?}"
+        );
+    }
+
+    #[test]
+    fn empty_agy_candidate_cache_does_not_block_later_discovery() {
+        let cache = tokio::sync::OnceCell::const_new();
+        let candidate = PathBuf::from("/tmp/agy");
+
+        assert!(cache_non_empty_agy_candidates(&cache, Vec::new()).is_empty());
+        assert_eq!(
+            cache_non_empty_agy_candidates(&cache, vec![candidate.clone()]),
+            vec![candidate.clone()]
+        );
+        assert_eq!(
+            cache_non_empty_agy_candidates(&cache, Vec::new()),
+            vec![candidate]
+        );
+    }
+
+    #[test]
+    fn agy_login_shell_discovery_waits_out_the_cooldown() {
+        let last = std::sync::Mutex::new(None);
+        let start = std::time::Instant::now();
+
+        assert!(claim_agy_login_shell_discovery(&last, start));
+        assert!(!claim_agy_login_shell_discovery(&last, start));
+        assert!(!claim_agy_login_shell_discovery(
+            &last,
+            start + AGY_LOGIN_SHELL_COOLDOWN - std::time::Duration::from_secs(1),
+        ));
+        assert!(claim_agy_login_shell_discovery(
+            &last,
+            start + AGY_LOGIN_SHELL_COOLDOWN,
+        ));
     }
 
     #[test]
@@ -2995,6 +3032,90 @@ mod tests {
             cache_binding: None,
             windows: Vec::new(),
         }
+    }
+
+    /// A credential that exists but cannot be parsed belongs to a configured
+    /// account, so it must NOT reach the absence marker. Before the split it
+    /// did: every `load_remote_credentials` failure became
+    /// `ANTIGRAVITY_UNCONFIGURED_ERROR`, so a corrupt `oauth_creds.json` took
+    /// the card out of tab navigation and claimed the user had never logged in.
+    #[test]
+    fn malformed_remote_credentials_are_unreadable_not_absent() {
+        let dir = std::env::temp_dir().join("tokenbar-antigravity-malformed-probe");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("oauth_creds.json");
+        std::fs::write(&path, b"{ this is not json").unwrap();
+
+        assert_eq!(
+            load_remote_credentials(&path),
+            Err(RemoteCredentialError::Unreadable)
+        );
+        let failure = remote_credentials_or_unconfigured(&path).unwrap_err();
+        assert!(
+            matches!(
+                failure,
+                ProviderFetchFailure::Terminal { ref display }
+                    if display == ANTIGRAVITY_UNREADABLE_ERROR
+            ),
+            "a corrupt credential must not read as an absent one, got {failure:?}"
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            load_remote_credentials(&path),
+            Err(RemoteCredentialError::Absent),
+            "control: the same path with the file gone IS absent, so the case above \
+             is the parse and not the path"
+        );
+    }
+
+    /// The reported machine's state, which this one cannot enter: no running
+    /// IDE, no Google credential, and an `agy` that cannot answer either. The
+    /// verdict has to be the ORIGINAL marker, because that is the string
+    /// `required_card_source` keys the `unconfigured` source on — if the CLI's
+    /// own "not found" replaced it, the card would report `oauth`, stop being a
+    /// setup placeholder, and the tab #345 removes would come back.
+    #[tokio::test]
+    async fn nothing_configured_survives_the_cli_route_as_the_unconfigured_marker() {
+        let agy_runs = std::cell::Cell::new(0);
+        let failure = with_agy_fallback(
+            Err(ProviderFetchFailure::terminal(
+                ANTIGRAVITY_UNCONFIGURED_ERROR,
+            )),
+            || async {
+                agy_runs.set(agy_runs.get() + 1);
+                Err(ProviderFetchFailure::terminal(
+                    "Antigravity CLI was not found.",
+                ))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            agy_runs.get(),
+            1,
+            "the CLI route is still tried before the verdict is taken"
+        );
+        assert!(
+            matches!(
+                failure,
+                ProviderFetchFailure::Terminal { ref display }
+                    if display == ANTIGRAVITY_UNCONFIGURED_ERROR
+            ),
+            "the CLI's failure must not replace the marker, got {failure:?}"
+        );
+
+        // Control: this machine's state. A CLI that answers makes the card
+        // configured, so the tab stays — the assertion above is about absence,
+        // not about the fallback being dead.
+        let fetched = with_agy_fallback(
+            Err(ProviderFetchFailure::terminal(
+                ANTIGRAVITY_UNCONFIGURED_ERROR,
+            )),
+            || async { Ok(orchestration_fetched("cli")) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(fetched.source, "cli");
     }
 
     fn orchestration_transient(display: &str) -> ProviderFetchFailure {
@@ -3594,8 +3715,9 @@ mod tests {
     async fn an_unresolvable_token_endpoint_does_not_spawn_the_cli() {
         let now = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
         let runs = std::cell::Cell::new(0);
+        let latch = std::sync::Mutex::new(AgyLatch::Idle);
 
-        let blocked = fetch_agy_cli_gated(now, false, |now| {
+        let blocked = fetch_agy_cli_gated(now, false, marker("m1"), &latch, |now| {
             runs.set(runs.get() + 1);
             async move { Ok(unreachable_probe_fetched(now)) }
         })
@@ -3606,13 +3728,168 @@ mod tests {
         // Control. Without it, `runs == 0` above would also hold if the gate
         // rejected every call for an unrelated reason, or if the runner were
         // never wired in at all.
-        let allowed = fetch_agy_cli_gated(now, true, |now| {
+        let allowed = fetch_agy_cli_gated(now, true, marker("m1"), &latch, |now| {
             runs.set(runs.get() + 1);
             async move { Ok(unreachable_probe_fetched(now)) }
         })
         .await;
         assert_eq!(runs.get(), 1, "a resolvable endpoint must still spawn agy");
         assert!(allowed.is_ok());
+    }
+
+    fn marker(value: &str) -> Option<String> {
+        Some(value.to_string())
+    }
+
+    fn agy_now() -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap()
+    }
+
+    /// Runs the gate once with a counting runner that answers `outcome`.
+    async fn run_gate(
+        latch: &std::sync::Mutex<AgyLatch>,
+        marker: Option<String>,
+        runs: &std::cell::Cell<usize>,
+        outcome: Result<(), bool>,
+    ) -> Result<Fetched, ProviderFetchFailure> {
+        fetch_agy_cli_gated(agy_now(), true, marker, latch, |now| {
+            runs.set(runs.get() + 1);
+            async move {
+                match outcome {
+                    Ok(()) => Ok(unreachable_probe_fetched(now)),
+                    Err(spawned) => Err(AgyRunError {
+                        failure: ProviderFetchFailure::terminal("Antigravity CLI usage failed."),
+                        spawned,
+                    }),
+                }
+            }
+        })
+        .await
+    }
+
+    fn latch_state(latch: &std::sync::Mutex<AgyLatch>) -> AgyLatch {
+        latch.lock().unwrap().clone()
+    }
+
+    /// Signed out, `agy --print /usage` opens a browser for OAuth (measured on
+    /// macOS). No Keychain login item must mean no spawn and no latch write.
+    #[tokio::test]
+    async fn a_missing_login_marker_does_not_spawn_the_cli() {
+        let latch = std::sync::Mutex::new(AgyLatch::Idle);
+        let runs = std::cell::Cell::new(0);
+
+        let blocked = run_gate(&latch, None, &runs, Ok(())).await;
+        assert_eq!(runs.get(), 0, "a signed-out agy must not be spawned");
+        assert!(matches!(blocked, Err(ProviderFetchFailure::Terminal { .. })));
+        assert_eq!(latch_state(&latch), AgyLatch::Idle);
+
+        // Control: the same gate with a marker does run.
+        assert!(run_gate(&latch, marker("m1"), &runs, Ok(())).await.is_ok());
+        assert_eq!(runs.get(), 1);
+        assert_eq!(latch_state(&latch), AgyLatch::Idle);
+    }
+
+    #[tokio::test]
+    async fn a_spawned_failure_latches_until_the_marker_changes() {
+        let latch = std::sync::Mutex::new(AgyLatch::Idle);
+        let runs = std::cell::Cell::new(0);
+
+        assert!(run_gate(&latch, marker("m1"), &runs, Err(true))
+            .await
+            .is_err());
+        assert_eq!(runs.get(), 1);
+        assert_eq!(latch_state(&latch), AgyLatch::Failed("m1".to_string()));
+
+        let paused = run_gate(&latch, marker("m1"), &runs, Ok(())).await;
+        assert_eq!(
+            runs.get(),
+            1,
+            "the same login must not respawn a failed agy"
+        );
+        assert!(matches!(paused, Err(ProviderFetchFailure::Terminal { .. })));
+        assert_eq!(latch_state(&latch), AgyLatch::Failed("m1".to_string()));
+
+        // A rewritten Keychain item (re-login) re-arms the route.
+        assert!(run_gate(&latch, marker("m2"), &runs, Ok(())).await.is_ok());
+        assert_eq!(runs.get(), 2, "a new login must spawn agy again");
+        assert_eq!(latch_state(&latch), AgyLatch::Idle);
+    }
+
+    #[tokio::test]
+    async fn a_failure_without_a_spawn_does_not_latch() {
+        let latch = std::sync::Mutex::new(AgyLatch::Idle);
+        let runs = std::cell::Cell::new(0);
+
+        assert!(run_gate(&latch, marker("m1"), &runs, Err(false))
+            .await
+            .is_err());
+        assert_eq!(runs.get(), 1);
+        assert_eq!(latch_state(&latch), AgyLatch::Idle);
+
+        assert!(run_gate(&latch, marker("m1"), &runs, Ok(())).await.is_ok());
+        assert_eq!(runs.get(), 2, "a CLI that was never found must not latch");
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_attempt_blocks_an_overlapping_poll() {
+        let latch = std::sync::Mutex::new(AgyLatch::InFlight);
+        let runs = std::cell::Cell::new(0);
+
+        let blocked = run_gate(&latch, marker("m1"), &runs, Ok(())).await;
+        assert_eq!(
+            runs.get(),
+            0,
+            "an overlapping poll must not spawn a second agy"
+        );
+        assert!(matches!(blocked, Err(ProviderFetchFailure::Terminal { .. })));
+        assert_eq!(latch_state(&latch), AgyLatch::InFlight);
+    }
+
+    /// A poll cancelled mid-run (the future dropped) must not leave the route
+    /// stuck in `InFlight` for the rest of the process.
+    #[tokio::test]
+    async fn a_cancelled_attempt_releases_the_latch() {
+        let latch = std::sync::Mutex::new(AgyLatch::Idle);
+        let runs = std::cell::Cell::new(0);
+
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            fetch_agy_cli_gated(agy_now(), true, marker("m1"), &latch, |_| {
+                runs.set(runs.get() + 1);
+                std::future::pending::<Result<Fetched, AgyRunError>>()
+            }),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the runner must still be pending");
+        assert_eq!(runs.get(), 1, "the runner must have started");
+        assert_eq!(latch_state(&latch), AgyLatch::Idle);
+
+        assert!(run_gate(&latch, marker("m1"), &runs, Ok(())).await.is_ok());
+        assert_eq!(runs.get(), 2);
+    }
+
+    // Pins that neither `-w` nor `-g` (which would request the secret) is added.
+    #[test]
+    fn keychain_query_requests_attributes_only() {
+        assert_eq!(
+            AGY_KEYCHAIN_QUERY,
+            &["find-generic-password", "-s", "gemini", "-a", "antigravity"]
+        );
+    }
+
+    #[test]
+    fn keychain_mdat_is_parsed_from_attribute_output() {
+        let with_mdat = "keychain: \"/Users/x/Library/Keychains/login.keychain-db\"\n\
+            attributes:\n    \"acct\"<blob>=\"antigravity\"\n    \
+            \"mdat\"<timedate>=0x32303236303932333137343035365A00  \"20260923174056Z\\000\"\n    \
+            \"svce\"<blob>=\"gemini\"\n";
+        assert_eq!(
+            parse_keychain_mdat(with_mdat).as_deref(),
+            Some("0x32303236303932333137343035365A00  \"20260923174056Z\\000\"")
+        );
+
+        let without_mdat = "attributes:\n    \"acct\"<blob>=\"antigravity\"\n";
+        assert_eq!(parse_keychain_mdat(without_mdat), None);
     }
 
     fn unreachable_probe_fetched(now: DateTime<Utc>) -> Fetched {
