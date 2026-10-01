@@ -25,12 +25,26 @@ jobs:
     # Same image as ci.yml's build job; see the comment there for why xcode-27.
     runs-on: xcode-27
     steps:
-      # No step after checkout needs the token: the submodule is fetched by
-      # checkout itself and SwiftPM clones Sparkle anonymously.
+      # The parent checkout does not need persistent credentials; the private
+      # engine submodule is fetched separately with its read-only deploy key.
       - uses: actions/checkout@v6
         with:
-          submodules: recursive
           persist-credentials: false
+
+      - name: Checkout private engine submodule
+        env:
+          ENGINE_DEPLOY_KEY: ${{ secrets.TOKSCALE_CORE_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "${ENGINE_DEPLOY_KEY:-}" ] || { echo "::error::TOKSCALE_CORE_DEPLOY_KEY is not configured"; exit 1; }
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$ENGINE_DEPLOY_KEY" > "$HOME/.ssh/tokscale_core"
+          chmod 600 "$HOME/.ssh/tokscale_core"
+          ssh-keyscan -H github.com >> "$HOME/.ssh/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/tokscale_core -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          git -c url."git@github.com:".insteadOf=https://github.com/ submodule update --init --force --depth=1 --recursive
+          git -C vendor/tokscale-core remote set-url origin git@github.com:HCH725/tokscale-core-custom.git
+          printf 'GIT_SSH_COMMAND=%s\n' "$GIT_SSH_COMMAND" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@stable
 
